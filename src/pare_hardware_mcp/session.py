@@ -210,14 +210,20 @@ class ConsoleSession:
                     in_progress: bool = False) -> dict:
         """Log a capture suspension AS IT STARTS, not after it ends.
 
-        Recorded the instant the reader actually parks (`in_progress=True`,
-        `duration_s` a placeholder), not in a `finally` once the whole scan
-        is over: a suspension that has been running for several seconds when
-        a concurrent `console_read`/`console_status` call lands is exactly
-        the reasoning hazard the gap ledger exists to prevent, and it does
-        not wait for the scan to finish before it applies. Returns the
-        entry object itself (not a copy) so `_finish_gap` can update it in
-        place once the real duration is known.
+        Called by the SCAN thread as soon as it observes the reader has
+        parked (`in_progress=True`, `duration_s` a placeholder), not in a
+        `finally` once the whole scan is over: a suspension that has been
+        running for several seconds when a concurrent `console_read`/
+        `console_status` call lands is exactly the reasoning hazard the gap
+        ledger exists to prevent, and it does not wait for the scan to
+        finish before it applies. Not quite "the instant the reader parks":
+        the reader (a different thread) sets `_scan_parked` and this is
+        called after the scan's own `.wait()` on it returns, so there is a
+        small gap between the two -- measured ~0.6ms, wider under cross-core
+        scheduling contention -- during which a landing call still sees the
+        pre-scan state. Returns the entry object itself (not a copy) so
+        `_finish_gap` can update it in place once the real duration is
+        known.
         """
         entry = {"at_cursor": at_cursor, "duration_s": round(duration_s, 3),
                  "reason": reason, "in_progress": in_progress}
@@ -487,16 +493,23 @@ class ConsoleSession:
         `sample_seconds * len(candidates actually sampled)` or more -- a real
         gap in the boot log a caller could otherwise reason straight across.
         Unlike `"rejected"`, that gap is not only reported after the fact:
-        `_record_gap` is called the instant the reader parks (`"in_progress":
-        True`, a placeholder duration), so a concurrent `console_read` sees
-        it (via `gaps_overlapping`) WHILE it is happening, not only on the
-        next call once this one has returned. A concurrent `console_status`
-        sees `capture_suspended: True` the same way -- but NOT a `duration_s`
-        that has grown to match: `gap_summary`'s `total_seconds` sums each
-        entry's `duration_s`, which is still the 0.0 placeholder for the
-        in-progress one, so `capture_suspended` is the explicit signal, not
-        the seconds. `_finish_gap` fills in the real duration when the scan
-        ends, whatever the reason. Returned here as `"gap"`.
+        `_record_gap` is called as soon as THIS (scan) thread observes the
+        park -- i.e. right after `_scan_parked.wait()` returns, not "the
+        instant the reader parks" (a different thread sets that event; the
+        two are not the same moment, only close -- measured ~0.6ms apart
+        naturally, wider under cross-core scheduling contention). A
+        concurrent `console_read` sees the entry (via `gaps_overlapping`,
+        `"in_progress": True`, a placeholder duration) WHILE the scan is
+        happening, not only on the next call once this one has returned --
+        modulo that same small bound, during which a landing call still sees
+        the pre-scan state. A concurrent `console_status` sees
+        `capture_suspended: True` the same way, subject to the same bound --
+        but NOT a `duration_s` that has grown to match: `gap_summary`'s
+        `total_seconds` sums each entry's `duration_s`, which is still the
+        0.0 placeholder for the in-progress one, so `capture_suspended` is
+        the explicit signal, not the seconds. `_finish_gap` fills in the
+        real duration when the scan ends, whatever the reason. Returned here
+        as `"gap"`.
 
         Raises `SessionError` for a bad rate list, a session that is not
         alive, a reader that will not park, or a `decide` callback that

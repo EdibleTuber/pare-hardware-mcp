@@ -164,7 +164,10 @@ async def test_a_winner_is_reported_and_the_session_is_left_there(monkeypatch):
 async def test_a_winner_sample_round_trips_through_base64(monkeypatch):
     session = FakeSession(scan_result=winner_result())
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    # Matches winner_result()'s two sampled rates -- see the comment on
+    # test_a_winner_is_reported_and_the_session_is_left_there for why a
+    # mismatch here would silently exercise the scan_aborted branch instead.
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
     winning = next(c for c in out["candidates"] if c["rate"] == 115200)
     assert base64.b64decode(winning["sample_b64"]) == b"U-Boot\r\nhello\r\n"
 
@@ -297,7 +300,10 @@ async def test_a_fully_completed_all_rejected_scan_is_not_misreported_as_aborted
 async def test_the_scans_own_capture_gap_is_reported(monkeypatch):
     session = FakeSession(scan_result=winner_result())
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    # Matches winner_result()'s two sampled rates -- see the comment on
+    # test_a_winner_is_reported_and_the_session_is_left_there for why a
+    # mismatch here would silently exercise the scan_aborted branch instead.
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
     assert out["capture_gap"] == GAP
 
 

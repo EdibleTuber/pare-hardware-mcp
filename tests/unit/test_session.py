@@ -1389,10 +1389,22 @@ def test_a_gap_is_visible_while_the_scan_is_still_running(manager, pty):
 
     thread = threading.Thread(target=run_scan, daemon=True)
     thread.start()
-    until(lambda: session._scan_parked.is_set(), what="the scan to pause the reader")
+    # NOT `until(lambda: session._scan_parked.is_set())`: that event is set
+    # by the READER thread the instant it parks, but the gap entry is
+    # appended by the SCAN thread separately, after IT wakes from
+    # `_scan_parked.wait()` and reaches `_record_gap`. Measured: a real,
+    # ~0.6ms window where `_scan_parked` already reads True but the ledger
+    # is still empty (wider under cross-core contention) -- waiting on that
+    # event was waiting for evidence only the OTHER thread produces. Waiting
+    # on the ledger itself is the correct synchronisation.
+    until(lambda: session._gaps, what="the scan to record its in-progress gap")
 
-    # Measured WHILE `_scan_parked` is set -- i.e. mid-scan, not after.
-    assert not scan_done.is_set(), "the scan already finished; this test proves nothing"
+    # Checked only now that the ledger entry actually exists. Against a
+    # pre-N1 implementation (gap recorded in the scan's `finally`, after the
+    # whole call returns) this wait blocks until `scan_baud` has already
+    # returned, so `scan_done` is already set and this still fails -- it
+    # does not go vacuous.
+    assert not scan_done.is_set(), "the gap only appeared after the scan returned"
     mid_scan_status = manager.status()
     assert mid_scan_status["capture_gap_count"] == 1, \
         "the gap must be counted the instant the reader parks, not only once the scan ends"
