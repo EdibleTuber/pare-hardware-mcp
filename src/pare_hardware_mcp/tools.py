@@ -202,13 +202,28 @@ async def console_detect_baud(device: str | None = None,
         alive=result["alive"],
         death_reason=result["death_reason"],
         candidates=candidates,
+        # A candidate the hardware itself rejected at apply time (not a
+        # sanitize_rates/scan_baud ceiling refusal, which never reaches
+        # here) -- named per rate, alongside whatever candidates DID get
+        # sampled. Never thrown away wholesale over one bad rate.
+        rejected=result["rejected"],
         # This scan suspended the reader for the duration of the sampling --
         # a real hole in the boot log, not just an implementation detail.
         # Also visible later via console_status (running totals) and
         # console_read (flagged on whichever read's window crosses it).
         capture_gap=result["gap"],
     )
-    if all_silent(samples):
+    if not samples and result["rejected"]:
+        # Distinct from a genuinely silent line: nothing was ever sampled
+        # because every candidate was refused before a byte could be read,
+        # so the ground/TX-RX-crossover hint below would be actively
+        # misleading -- the problem is the rate list, not the wiring.
+        response["verdict"] = "all_candidate_rates_rejected"
+        response["note"] = (
+            "every candidate rate was rejected by this hardware before any "
+            "sample could be taken; see \"rejected\" for why each one failed"
+        )
+    elif all_silent(samples):
         response["verdict"] = "no_data_at_any_rate"
         response["hint"] = GROUND_CROSSOVER_HINT
     elif result["restored"]:

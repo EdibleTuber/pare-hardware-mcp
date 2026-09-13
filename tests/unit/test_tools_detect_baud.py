@@ -50,12 +50,13 @@ def install(monkeypatch, session=None, deadline=60.0):
     return manager
 
 
-GAP = {"at_cursor": 42, "duration_s": 12.0, "reason": "baud scan"}
+GAP = {"at_cursor": 42, "duration_s": 12.0, "reason": "baud scan", "in_progress": False}
 
 
 def winner_result(original=9600, final=115200):
     return {
         "samples": {9600: b"\x00\x00garbage\xff", 115200: b"U-Boot\r\nhello\r\n"},
+        "rejected": {},
         "original_baud": original,
         "final_baud": final,
         "restored": final == original,
@@ -167,6 +168,7 @@ async def test_a_winner_sample_round_trips_through_base64(monkeypatch):
 async def test_no_clear_winner_reports_the_restored_rate(monkeypatch):
     result = {
         "samples": {9600: bytes(range(128, 256)), 115200: bytes(range(128, 256))},
+        "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
     }
@@ -181,6 +183,7 @@ async def test_no_clear_winner_reports_the_restored_rate(monkeypatch):
 async def test_a_totally_silent_line_names_ground_and_crossover(monkeypatch):
     result = {
         "samples": {9600: b"", 115200: b""},
+        "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
     }
@@ -190,6 +193,43 @@ async def test_a_totally_silent_line_names_ground_and_crossover(monkeypatch):
     assert out["verdict"] == "no_data_at_any_rate"
     assert "ground" in out["hint"].lower()
     assert "tx" in out["hint"].lower() and "rx" in out["hint"].lower()
+
+
+async def test_all_candidates_rejected_is_distinguished_from_a_silent_line(monkeypatch):
+    """The reviewer's N4 fix: rejection is per-candidate, not scan-aborting.
+
+    When EVERY candidate was rejected before any byte could be sampled, the
+    ground/TX-RX-crossover hint would be actively misleading -- the problem
+    is the rate list, not the wiring -- so this must be a distinct verdict.
+    """
+    result = {
+        "samples": {},
+        "rejected": {250000: "kernel rejected it", 999999: "kernel rejected it"},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": True, "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud())
+    assert out["verdict"] == "all_candidate_rates_rejected"
+    assert "hint" not in out
+    assert out["rejected"] == {"250000": "kernel rejected it", "999999": "kernel rejected it"}
+
+
+async def test_a_partial_rejection_still_reports_ranked_evidence(monkeypatch):
+    """One bad candidate must not throw away another candidate's good sample."""
+    result = {
+        "samples": {9600: b"U-Boot\r\nhello\r\n"},
+        "rejected": {250000: "kernel rejected it"},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": True, "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud())
+    assert out["verdict"] != "all_candidate_rates_rejected"
+    assert {c["rate"] for c in out["candidates"]} == {9600}
+    assert out["rejected"] == {"250000": "kernel rejected it"}
 
 
 # --------------------------------------------------------------------------

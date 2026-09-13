@@ -206,14 +206,31 @@ class ConsoleSession:
     def closed(self) -> bool:
         return self._closed
 
-    def _record_gap(self, *, at_cursor: int, duration_s: float, reason: str) -> dict:
-        """Log a capture suspension. Returns the entry, for the caller that
-        just caused it (`scan_baud`) to hand back in its own result too."""
+    def _record_gap(self, *, at_cursor: int, duration_s: float, reason: str,
+                    in_progress: bool = False) -> dict:
+        """Log a capture suspension AS IT STARTS, not after it ends.
+
+        Recorded the instant the reader actually parks (`in_progress=True`,
+        `duration_s` a placeholder), not in a `finally` once the whole scan
+        is over: a suspension that has been running for several seconds when
+        a concurrent `console_read`/`console_status` call lands is exactly
+        the reasoning hazard the gap ledger exists to prevent, and it does
+        not wait for the scan to finish before it applies. Returns the
+        entry object itself (not a copy) so `_finish_gap` can update it in
+        place once the real duration is known.
+        """
         entry = {"at_cursor": at_cursor, "duration_s": round(duration_s, 3),
-                 "reason": reason}
+                 "reason": reason, "in_progress": in_progress}
         with self._gaps_lock:
             self._gaps.append(entry)
         return entry
+
+    def _finish_gap(self, entry: dict, duration_s: float) -> None:
+        """Fill in the real duration once the suspension that `entry`
+        recorded has actually ended."""
+        with self._gaps_lock:
+            entry["duration_s"] = round(duration_s, 3)
+            entry["in_progress"] = False
 
     def gaps_overlapping(self, start_cursor: int, end_cursor: int) -> list[dict]:
         """Every gap whose `at_cursor` sits inside `[start_cursor, end_cursor]`.
@@ -438,7 +455,14 @@ class ConsoleSession:
         since pyserial's custom-baud path turns a kernel-rejected rate into
         `ValueError` and the termios `array('i')` store overflows for
         anything at or above 2**31, neither of which is safe to leave
-        unhandled from a tier-low, never-prompted tool.
+        unhandled from a tier-low, never-prompted tool. A candidate that
+        PASSES that check but the hardware itself still refuses at apply
+        time does NOT abort the scan: it is recorded in the returned
+        `"rejected"` dict (`{rate: reason}`) and the next candidate is tried.
+        Invariant 5 is ranked evidence, never a bare verdict -- discarding
+        every other candidate's perfectly good sample because one rate the
+        specific chip does not support raised would be exactly that bare
+        verdict, just spelled as an exception instead of a guess.
 
         However this returns or raises, the port is left at a KNOWN rate
         (the winner, or the rate the session started at) and `self.baud`
@@ -449,14 +473,18 @@ class ConsoleSession:
         Pausing the reader for the scan means capture stops advancing for
         `sample_seconds * len(candidates actually sampled)` or more -- a real
         gap in the boot log a caller could otherwise reason straight across.
-        That gap is recorded via `_record_gap` (see its docstring) whenever
-        the reader actually parked, regardless of how the scan ends, and is
-        returned here as `"gap"`.
+        Unlike `"rejected"`, that gap is not only reported after the fact:
+        `_record_gap` is called the instant the reader parks (`"in_progress":
+        True`, a placeholder duration), so a concurrent `console_status` or
+        `console_read` sees it WHILE it is happening, not only on the next
+        call once this one has returned -- `_finish_gap` fills in the real
+        duration when the scan ends, whatever the reason. Returned here as
+        `"gap"`.
 
         Raises `SessionError` for a bad rate list, a session that is not
-        alive, a reader that will not park, a candidate rate the hardware
-        rejects, or a `decide` callback that raises -- always with the port
-        left at a known rate.
+        alive, a reader that will not park, or a `decide` callback that
+        raises -- always with the port left at a known rate. Does NOT raise
+        for a candidate rate the hardware rejects; see `"rejected"` above.
         """
         if not rates:
             raise SessionError("scan_baud: no candidate rates given")
@@ -489,6 +517,7 @@ class ConsoleSession:
 
             original_baud = self.baud
             samples: dict[int, bytes] = {}
+            rejected: dict[int, str] = {}
             winner: int | None = None
             # Pre-set to the fallback: if anything below raises before a
             # winner is chosen, the `finally` still restores a KNOWN rate
@@ -496,7 +525,6 @@ class ConsoleSession:
             # left in the termios struct.
             final_baud = original_baud
             gap_start_time: float | None = None
-            gap_at_cursor: int | None = None
             gap_entry: dict | None = None
 
             self._scan_pause.set()
@@ -511,10 +539,21 @@ class ConsoleSession:
 
                 # The gap begins here, not at `_scan_pause.set()`: this is
                 # the instant the reader has actually stopped reading, which
-                # is also the instant `head` stops advancing.
+                # is also the instant `head` stops advancing. Recorded (not
+                # just timestamped) immediately, and visible to a concurrent
+                # console_status/console_read for the whole scan -- not only
+                # after the fact -- because a suspension in progress is
+                # exactly the same reasoning hazard for a caller mid-read as
+                # one already finished; the only thing it does not yet know
+                # is how long it will run.
                 buffer = self._buffer
-                gap_at_cursor = buffer.head if buffer is not None else 0
                 gap_start_time = time.monotonic()
+                gap_entry = self._record_gap(
+                    at_cursor=buffer.head if buffer is not None else 0,
+                    duration_s=0.0,
+                    reason="baud scan",
+                    in_progress=True,
+                )
 
                 try:
                     for rate in rates:
@@ -548,12 +587,16 @@ class ConsoleSession:
                             # the termios array('i') store raises
                             # OverflowError for a rate that does not fit a
                             # C int (>= 2**31). Neither means the device is
-                            # gone -- a healthy session must not be `_die`d
-                            # over one bad candidate value.
-                            raise SessionError(
-                                f"session {self.id}: {rate} is not a usable "
-                                f"baud rate on this hardware: {exc}"
-                            ) from exc
+                            # gone, and neither means the REST of the scan
+                            # is untrustworthy: invariant 5 is ranked
+                            # evidence, never a bare verdict, and aborting
+                            # every other candidate over one the hardware
+                            # itself refuses would throw away perfectly
+                            # good samples already in hand (or still to
+                            # come) for no reason connected to them. Record
+                            # the rejection and try the next rate.
+                            rejected[rate] = str(exc)
+                            continue
 
                         collected = bytearray()
                         deadline = time.monotonic() + sample_seconds
@@ -598,16 +641,13 @@ class ConsoleSession:
             finally:
                 self._scan_pause.clear()
                 if gap_start_time is not None:
-                    gap_entry = self._record_gap(
-                        at_cursor=gap_at_cursor,
-                        duration_s=time.monotonic() - gap_start_time,
-                        reason="baud scan",
-                    )
+                    self._finish_gap(gap_entry, time.monotonic() - gap_start_time)
         finally:
             self._write_lock.release()
 
         return {
             "samples": samples,
+            "rejected": rejected,
             "original_baud": original_baud,
             "final_baud": final_baud,
             # `winner is None`, NOT `final_baud == original_baud`: a `decide`

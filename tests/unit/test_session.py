@@ -1366,6 +1366,47 @@ def test_a_gap_is_visible_in_status_as_a_running_count_and_total(manager, pty):
     assert after_two["capture_gap_seconds"] > after_one["capture_gap_seconds"]
 
 
+def test_a_gap_is_visible_while_the_scan_is_still_running(manager, pty):
+    """N1: the entry must exist for the ~12s the scan is actually paused, not
+    only after it returns -- a concurrent console_read/console_status during
+    that window is exactly the reasoning hazard the ledger exists to prevent,
+    just relocated to the live case instead of the retrospective one.
+    """
+    session = open_ok(manager, pty)
+    pty.send(b"pre-scan\r\n")
+    until(lambda: session.buffer.head > 0, what="pre-scan capture")
+    cursor_before = session.buffer.head
+
+    scan_done = threading.Event()
+
+    def run_scan():
+        session.scan_baud((9600, 115200, 230400), 0.3, no_op_decide)
+        scan_done.set()
+
+    thread = threading.Thread(target=run_scan, daemon=True)
+    thread.start()
+    until(lambda: session._scan_parked.is_set(), what="the scan to pause the reader")
+
+    # Measured WHILE `_scan_parked` is set -- i.e. mid-scan, not after.
+    assert not scan_done.is_set(), "the scan already finished; this test proves nothing"
+    mid_scan_status = manager.status()
+    assert mid_scan_status["capture_gap_count"] == 1, \
+        "the gap must be counted the instant the reader parks, not only once the scan ends"
+    mid_scan_gaps = session.gaps_overlapping(cursor_before, cursor_before + 1)
+    assert len(mid_scan_gaps) == 1
+    assert mid_scan_gaps[0]["in_progress"] is True
+    assert mid_scan_gaps[0]["at_cursor"] == cursor_before
+
+    thread.join(DEADLINE)
+    assert scan_done.is_set()
+    # And once it's over, the SAME entry is finalised, not duplicated.
+    assert manager.status()["capture_gap_count"] == 1
+    finished = session.gaps_overlapping(cursor_before, cursor_before + 1)
+    assert len(finished) == 1
+    assert finished[0]["in_progress"] is False
+    assert finished[0]["duration_s"] >= 0.3
+
+
 def test_a_failed_scan_still_records_its_gap(manager, pty):
     """The reader was still paused for the duration, even though the scan
     itself failed -- that suspended time must not disappear from the ledger
@@ -1404,11 +1445,20 @@ def test_gaps_overlapping_flags_only_gaps_inside_the_requested_window(manager, p
 
 class _BaudRejectingSerial:
     """Wraps a real, already-open `serial.Serial`; setting `baudrate` to
-    `fail_rate` raises `exc` instead of touching the port -- reproducing
+    `fail_rate` APPLIES it for real first (so the fd genuinely ends up at a
+    different, verifiable speed) and THEN raises `exc` -- reproducing
     pyserial's own custom-baud failure modes (ValueError from a
     kernel-rejected rate, OverflowError from the termios `array('i')` store
-    for a rate >= 2**31) without depending on a specific rate actually being
-    rejected by whatever this test happens to run against."""
+    for a rate >= 2**31) with real corrupted state for the restore to repair.
+
+    A version that raised WITHOUT touching the real port first (this
+    fixture's previous shape) only proves the exception path doesn't crash --
+    it never exercises the restore at all, since there is nothing to restore.
+    Confirmed on a pty: setting a custom (non-standard-table) rate really
+    does change `termios.tcgetattr(fd)[5]` away from `termios.B9600`, and
+    setting it back really does change it back -- this is not a Python-level
+    cache, it is the kernel's own state for the fd.
+    """
 
     def __init__(self, real, fail_rate, exc):
         object.__setattr__(self, "_real", real)
@@ -1419,32 +1469,49 @@ class _BaudRejectingSerial:
         return getattr(object.__getattribute__(self, "_real"), name)
 
     def __setattr__(self, name, value):
+        real = object.__getattribute__(self, "_real")
         if name == "baudrate" and value == object.__getattribute__(self, "_fail_rate"):
+            setattr(real, name, value)  # apply for real -- the corruption must exist
             raise object.__getattribute__(self, "_exc")
-        setattr(object.__getattribute__(self, "_real"), name, value)
+        setattr(real, name, value)
 
 
 @pytest.mark.parametrize("exc", [ValueError("kernel rejected it"),
                                  OverflowError("Python int too large to convert to C int")])
-def test_a_hardware_rejected_rate_restores_and_raises_without_dying(manager, pty, exc):
+def test_a_hardware_rejected_rate_is_recorded_and_the_scan_continues(manager, pty, exc):
     """Reproduces the review's finding against `rates=[9600, 2147483648, 115200]`:
     pyserial converts a kernel-rejected custom rate to ValueError, and the
-    array('i') termios struct overflows for a rate >= 2**31 -- before this
-    fix, neither was caught, the restore (originally placed after the loop)
-    was skipped, and the port was left at whatever tcsetattr had already
-    applied while `self.baud` kept reporting the old value.
+    array('i') termios struct overflows for a rate >= 2**31.
+
+    N4: this must NOT abort the whole scan (invariant 5 is ranked evidence,
+    never a bare verdict) -- the other candidates are still sampled, and the
+    rejection is named in the result rather than raised.
+
+    Restore is verified against the REAL fd via `termios.tcgetattr`, not
+    `serial.Serial.baudrate` -- that getter returns pyserial's own cached
+    `_baudrate`, which the setter assigns BEFORE calling
+    `_reconfigure_port()` (serialutil.py), so it reads back whatever was
+    last ASKED for rather than what the kernel actually holds.
     """
+    import termios
+
     session = open_ok(manager, pty, baud=9600)
     original = session._serial
+    assert termios.tcgetattr(original.fd)[5] == termios.B9600
     session._serial = _BaudRejectingSerial(original, fail_rate=333333, exc=exc)
     try:
-        with pytest.raises(SessionError) as e:
-            session.scan_baud((9600, 333333, 115200), 0.1, no_op_decide)
-        assert "333333" in str(e.value)
+        result = session.scan_baud((9600, 333333, 115200), 0.1, no_op_decide)
 
-        # Restored, not left at an undefined rate with a stale self.baud.
+        assert 333333 in result["rejected"]
+        assert result["rejected"][333333] == str(exc)
+        # The OTHER candidates were still sampled -- one bad rate did not
+        # throw away the rest.
+        assert set(result["samples"]) == {9600, 115200}
+
+        # Restored on the REAL fd -- not merely a Python attribute that
+        # claims 9600 while the kernel still holds the corrupted rate.
+        assert termios.tcgetattr(original.fd)[5] == termios.B9600
         assert session.baud == 9600
-        assert original.baudrate == 9600
         # A bad candidate value is not a device fault -- the session must
         # stay healthy.
         assert session.alive is True
@@ -1486,7 +1553,18 @@ def test_only_the_scanning_thread_calls_port_read_while_paused(manager, pty):
     lock = threading.Lock()
 
     def spy(*args, **kwargs):
-        if session._scan_pause.is_set():
+        # Gated on BOTH flags, not just `_scan_pause`: the reader checks
+        # `_scan_pause` and calls `port.read()` as two separate statements
+        # (`_read_forever`), so there is a real window, between the scan
+        # setting `_scan_pause` and the reader finishing its own in-flight
+        # read from BEFORE the scan even started, where `_scan_pause` is set
+        # but the reader has not parked yet. A predicate on `_scan_pause`
+        # alone records that entirely legitimate last read as a false
+        # "culprit" -- confirmed by widening the window with a sleep here,
+        # which produced failures against known-correct code every time
+        # until this gate was added. `_scan_parked` being set is what
+        # actually means "the scan believes it holds the port alone".
+        if session._scan_pause.is_set() and session._scan_parked.is_set():
             with lock:
                 callers_while_paused.append(threading.current_thread())
         return real_read(*args, **kwargs)
@@ -1572,7 +1650,17 @@ def test_scan_baud_samples_never_reach_the_capture_buffer(manager, pty):
         f"buffer.head grew from {head_at_park} to {max(observed_heads)} while "
         "the scan believed it was the only thing reading the port"
     )
-    assert session.buffer.head == head_at_park
+    # NOT `assert session.buffer.head == head_at_park` here: by this point
+    # `scan_baud` has already returned, which means `_scan_pause` is already
+    # clear and the reader has already resumed -- correctly. Bisected: 0ms
+    # and 20ms of slack after `scan_done` passed, 40ms and 250ms failed with
+    # `head` genuinely grown (128 -> 256), because the resumed reader's own
+    # next read legitimately appended more of the continuous sender's bytes.
+    # That is correct behaviour, not the violation this test exists to
+    # catch -- asserting on it here tests a coincidence of timing, not the
+    # invariant. `max(observed_heads)` above is the sound check: every value
+    # in it was sampled from inside the `while not scan_done.is_set()` loop,
+    # i.e. while the scan was still actually running.
 
     total_sampled = sum(len(v) for v in scan_result["value"]["samples"].values())
     assert total_sampled > 0, (
