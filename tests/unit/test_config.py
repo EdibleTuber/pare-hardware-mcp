@@ -70,3 +70,48 @@ def test_a_non_positive_request_deadline_is_refused(monkeypatch):
     monkeypatch.setenv("PARE_HW_REQUEST_DEADLINE_S", "0")
     with pytest.raises(ValueError):
         load_config()
+
+
+def test_artifact_root_defaults_to_none_when_unset(monkeypatch):
+    monkeypatch.delenv("PARE_HW_ARTIFACT_ROOT", raising=False)
+    assert load_config().artifact_root is None
+
+
+def test_artifact_root_is_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("PARE_HW_ARTIFACT_ROOT", "/mnt/bench-store")
+    assert load_config().artifact_root == "/mnt/bench-store"
+
+
+def test_an_empty_artifact_root_env_var_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("PARE_HW_ARTIFACT_ROOT", "")
+    assert load_config().artifact_root is None
+
+
+def test_buffer_bytes_defaults_to_the_ringbuffer_default(monkeypatch):
+    from pare_hardware_mcp.ringbuffer import DEFAULT_CAPACITY
+    monkeypatch.delenv("PARE_HW_BUFFER_BYTES", raising=False)
+    assert load_config().buffer_bytes == DEFAULT_CAPACITY
+
+
+def test_buffer_bytes_is_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("PARE_HW_BUFFER_BYTES", "1048576")
+    assert load_config().buffer_bytes == 1048576
+
+
+def test_an_empty_buffer_bytes_env_var_is_treated_as_unset(monkeypatch):
+    from pare_hardware_mcp.ringbuffer import DEFAULT_CAPACITY
+    monkeypatch.setenv("PARE_HW_BUFFER_BYTES", "")
+    assert load_config().buffer_bytes == DEFAULT_CAPACITY
+
+
+def test_a_non_numeric_buffer_bytes_is_a_clear_error_not_a_crash(monkeypatch):
+    monkeypatch.setenv("PARE_HW_BUFFER_BYTES", "lots")
+    with pytest.raises(ValueError) as e:
+        load_config()
+    assert "lots" in str(e.value)
+
+
+def test_a_non_positive_buffer_bytes_is_refused(monkeypatch):
+    monkeypatch.setenv("PARE_HW_BUFFER_BYTES", "0")
+    with pytest.raises(ValueError):
+        load_config()

@@ -8,13 +8,13 @@ So the systemd unit's `Environment=` is the only channel an operator has to
 declare the by-id device path this worker should open, or the serial
 `console_open` must assert before it ever touches a board.
 
-A later task adds PARE_HW_ARTIFACT_ROOT and PARE_HW_BUFFER_BYTES here,
-alongside the two below.
 """
 from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+
+from pare_hardware_mcp.ringbuffer import DEFAULT_CAPACITY
 
 
 @dataclass(frozen=True)
@@ -39,6 +39,17 @@ class Config:
     # invented number. An operator overrides it once the hardware worker
     # itself is networked and has its own `read_timeout` declared.
     request_deadline_s: float = 60.0
+    # PARE_HW_ARTIFACT_ROOT: the directory `bench_status` inspects for
+    # presence, writability and a `.bench-store-id` drive id. Not opened,
+    # written to, or otherwise dispatched against by phase 1 -- artifacts are
+    # out of scope (see contract.py) -- so `None` when unset is a normal
+    # "this worker has no artifact root declared" state, not an error.
+    artifact_root: str | None = None
+    # PARE_HW_BUFFER_BYTES: worker-configurable capture-buffer capacity. The
+    # design derives 64 MiB (ringbuffer.DEFAULT_CAPACITY) as the default from
+    # observed boot-log volume; an operator with a more talkative target or a
+    # tighter memory budget overrides it here.
+    buffer_bytes: int = DEFAULT_CAPACITY
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -54,10 +65,26 @@ def _positive_float_env(name: str, default: float) -> float:
     return value
 
 
+def _positive_int_env(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not an integer") from None
+    if value <= 0:
+        raise ValueError(f"{name}={raw!r} must be positive")
+    return value
+
+
 def load_config() -> Config:
     return Config(
         device=os.environ.get("PARE_HW_DEVICE") or None,
         expect_serial=os.environ.get("PARE_HW_EXPECT_SERIAL") or None,
         request_deadline_s=_positive_float_env(
             "PARE_HW_REQUEST_DEADLINE_S", 60.0),
+        artifact_root=os.environ.get("PARE_HW_ARTIFACT_ROOT") or None,
+        buffer_bytes=_positive_int_env(
+            "PARE_HW_BUFFER_BYTES", DEFAULT_CAPACITY),
     )

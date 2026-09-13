@@ -12,6 +12,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import os
+import re
 from typing import Any
 
 from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_SAMPLE_SECONDS,
@@ -19,11 +21,19 @@ from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_SAMPLE_SECONDS,
                                     check_budget, pick_winner,
                                     rank_candidates, sanitize_rates)
 from pare_hardware_mcp.config import load_config
+from pare_hardware_mcp.devices import list_serial_devices
 from pare_hardware_mcp.ringbuffer import CursorError
 from pare_hardware_mcp.session import SessionError, SessionManager
 
 MANAGER = SessionManager()
 CONFIG = load_config()
+
+# A `.bench-store-id` value reaches an operator's terminal via bench_status --
+# the same "escape sequence rewrites what the operator sees" problem the
+# artifact-wiring design's `_CONTROL_RE` addresses for `path` and `drive_id`.
+# Stripped here, at the point this worker reads it off disk, rather than
+# trusted through to the caller.
+_CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
 def _ok(**fields: Any) -> str:
@@ -268,3 +278,73 @@ async def console_detect_baud(device: str | None = None,
             "open, and therefore no second DTR assertion at the target"
         )
     return _ok(**response)
+
+
+def _device_summary(device) -> dict[str, Any]:
+    # by_id/tty/serial/interface only -- NEVER voltage. The Tigard's level
+    # selector is a physical slide switch with no software read-back,
+    # unlike everything else here; a reported number is a guess an operator
+    # could trust, and trusting a wrong one drives 5V into a 3.3V target.
+    return {"by_id": device.by_id, "tty": device.tty,
+            "serial": device.serial, "interface": device.interface}
+
+
+async def list_devices() -> str:
+    """List serial adapters present. Never reports voltage -- see module note."""
+    return _ok(devices=[_device_summary(d) for d in list_serial_devices()])
+
+
+def _artifact_root_status(root: str | None) -> dict[str, Any]:
+    """The artifact root's live state: present?, writable?, drive id.
+
+    Read-only: `os.access` and a file read, never a write -- bench_status
+    must answer cheaply with no session open and never dispatch anything
+    that writes.
+    """
+    if not root or not os.path.isdir(root):
+        return {"declared": root, "present": False, "writable": False,
+                "drive_id": None}
+
+    writable = os.access(root, os.W_OK)
+    drive_id = None
+    id_path = os.path.join(root, ".bench-store-id")
+    if os.path.isfile(id_path):
+        try:
+            raw = open(id_path, "r").read().strip()
+        except OSError:
+            raw = ""
+        if raw:
+            # Sanitize rather than pass through: this value is about to
+            # reach an operator's terminal in a bench_status response.
+            drive_id = _CONTROL_RE.sub("", raw)
+
+    return {"declared": root, "present": True, "writable": writable,
+            "drive_id": drive_id}
+
+
+async def bench_status() -> str:
+    """Bench health with no session required: adapters, artifact root, drive id.
+
+    §8.4 (see pare/commands/health.py) puts the live artifact-root answer
+    behind this low-tier tool because the daemon resolving the path itself
+    would resolve against the wrong machine's filesystem. Reads the
+    environment fresh on every call, not the module-level `CONFIG` snapshot
+    taken at import time: this worker is reached over `streamable_http`, so
+    `Environment=` in the systemd unit is the only channel an operator has,
+    and a unit reload must be visible on the next call rather than requiring
+    a worker restart.
+
+    Never opens, closes or otherwise dispatches against a session -- `status`
+    is read-only, matching this tool's low tier.
+    """
+    cfg = load_config()
+    session_status = MANAGER.status()
+    return _ok(
+        devices=[_device_summary(d) for d in list_serial_devices()],
+        artifact_root=_artifact_root_status(cfg.artifact_root),
+        session={
+            "open": session_status["open"],
+            "session": session_status["session"],
+            "alive": session_status["alive"],
+        },
+    )
