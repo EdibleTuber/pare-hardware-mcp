@@ -128,3 +128,6 @@ dmypy.json
 *.swp
 *.swo
 *~
+
+# SDD scratch (controller artifacts, not part of the package)
+.superpowers/
