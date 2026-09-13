@@ -310,12 +310,25 @@ class ConsoleSession:
             # telling a language model its command reached the board when
             # nothing did. On a hardware console a false report about physical
             # state is the worst thing this worker can do.
+            #
+            # The count is a LOWER BOUND, not a boundary. pyserial's abort
+            # `break` (serialposix.py:633) happens before `d = d[n:]`
+            # (:658), so the final `os.write` of the loop is never deducted
+            # from `length - len(d)` -- and every iteration writes before it
+            # selects, so there is always exactly one such chunk. Measured on
+            # a slow-draining pty: 64000 reported, 73728 actually delivered.
+            # Stating it as exact would invite a caller to resume from that
+            # offset and resend bytes that already reached the board, on a
+            # live console driving hardware.
             if written != len(data):
                 raise SessionError(
-                    f"write on session {self.id} was aborted after "
+                    f"write on session {self.id} was aborted after at least "
                     f"{written} of {len(data)} bytes (the session is being "
-                    "closed). The target received only that prefix; assume "
-                    "the command did not take effect."
+                    "closed). The exact boundary is not knowable -- pyserial's "
+                    "abort drops the last chunk from its count -- so more than "
+                    f"{written} bytes may have reached the target. Assume the "
+                    "command did not take effect, and do not resume from this "
+                    "offset."
                 )
 
     def _shutdown(self) -> str | None:
@@ -382,6 +395,14 @@ class ConsoleSession:
                 )
             with self._state_lock:
                 self._alive = False
+            # On the `acquired` path these run under `_write_lock`; on the
+            # expiry path they do not, and that is safe for reasons that have
+            # changed since this was first written. `_closing` -- set before
+            # the acquire above -- is what now stops a queued writer, so
+            # `_closed` is no longer the flag a writer races for. And
+            # `_read_forever` holds its own reference to the buffer, taken
+            # when the thread started, so dropping `_buffer` here cannot trip
+            # a reader that is still finishing its last append.
             self._closed = True
             self._buffer = None
         finally:
@@ -560,11 +581,12 @@ class SessionManager:
             port.open()
         except (serial.SerialException, OSError) as exc:
             hint = ""
-            if self.last_close_warning:
+            warning = self.last_close_warning
+            if warning:
                 # Otherwise this surfaces to a language model as a bare EAGAIN
-                # immediately after a successful close, with nothing to connect
-                # the two.
-                hint = f" (the last close reported: {self.last_close_warning})"
+                # immediately after a close it just watched succeed, with
+                # nothing to connect the two.
+                hint = f" (note: {warning})"
             raise SessionError(
                 f"could not open {resolved.by_id} (tty {resolved.tty}) at "
                 f"{baud} baud: {exc}{hint}"
@@ -595,9 +617,13 @@ class SessionManager:
 
         The cost is that a *concurrent* `open` on the same device, arriving
         between the slot being freed and the port being released, fails on the
-        exclusive lock. That is loud, and `last_close_warning` explains it; a
-        sequential close-then-open is unaffected, because `_shutdown` has
-        returned before `close` does.
+        exclusive lock. `last_close_warning` is therefore *published* under the
+        manager lock before the shutdown starts, not cleared: an `open` landing
+        inside that window has to be able to explain its own failure, and that
+        window is the whole reason the warning exists. It is replaced with the
+        shutdown's real outcome -- `None`, or the drain warning -- once
+        `_shutdown` returns. A sequential close-then-open is unaffected either
+        way, because `_shutdown` has returned before `close` does.
         """
         with self._lock:
             current = self._current
@@ -607,7 +633,13 @@ class SessionManager:
                     f"(open session: {current.id if current else 'none'})"
                 )
             self._current = None
-            self.last_close_warning = None
+            # Provisional, and deliberately not None: for as long as
+            # `_shutdown` runs, this is the only thing that can tell a
+            # concurrent `open` why the port it just saw freed will not open.
+            self.last_close_warning = (
+                f"session {current.id} on {current.device.by_id} is closing; "
+                "the port may be held for a moment longer"
+            )
         self.last_close_warning = current._shutdown()
 
     def status(self) -> dict:

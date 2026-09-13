@@ -16,6 +16,7 @@ from __future__ import annotations
 import gc
 import inspect
 import os
+import re
 import select
 import threading
 import time
@@ -67,6 +68,38 @@ class Pty:
         if not ready:
             return b""
         return os.read(self.master, 65536)
+
+    def drain_slowly(self, stop: threading.Event, chunk: int = 512,
+                     interval: float = 0.002) -> threading.Thread:
+        """Read the far end slowly, so a big write stays in flight.
+
+        Returns the thread; the bytes it collects land in `self.received`.
+        """
+        self.received = bytearray()
+        os.set_blocking(self.master, False)
+
+        def pump():
+            while not stop.is_set():
+                try:
+                    self.received.extend(os.read(self.master, chunk))
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    return
+                time.sleep(interval)
+
+        thread = threading.Thread(target=pump, daemon=True)
+        thread.start()
+        return thread
+
+    def drain_rest(self) -> None:
+        """Collect whatever is still sitting in the pty buffer."""
+        os.set_blocking(self.master, False)
+        while True:
+            try:
+                self.received.extend(os.read(self.master, 65536))
+            except (BlockingIOError, OSError):
+                return
 
     def unplug_far_end(self) -> None:
         """Close the master: the device node stops answering reads."""
@@ -761,6 +794,10 @@ def test_concurrent_writes_and_a_close_never_release_the_fd_under_a_writer(
     # instantly once the session is closing, so only one write is outstanding.
     assert manager.last_close_warning is None, manager.last_close_warning
     assert elapsed < WRITE_DRAIN_TIMEOUT, f"close took {elapsed:.2f}s"
+    # The serialisation `_write_lock` exists for, asserted directly rather
+    # than inferred from how long the close took.
+    assert state["peak"] == 1, \
+        f"{state['peak']} writers were inside serial.write() at once"
 
     assert finished.wait(DEADLINE)
     for thread in threads:
@@ -849,6 +886,101 @@ def test_a_cancelled_write_is_not_reported_as_a_successful_send(manager, pty):
     # An abort is not a device failure.
     assert session.alive is True
     assert session.death_reason is None
+
+
+def test_an_aborted_write_reports_a_lower_bound_not_a_prefix_boundary(manager, pty):
+    """pyserial's abort count is short by one chunk, always.
+
+    `break` on abort (serialposix.py:633) happens before `d = d[n:]` (:658),
+    and every iteration of the loop writes before it selects -- so the final
+    `os.write` is never deducted from `length - len(d)`. Reporting that count
+    as the exact prefix the target received would invite a caller to resume
+    from the offset and resend bytes that already reached the board.
+    """
+    session = open_ok(manager, pty)
+    stop = threading.Event()
+    pump = pty.drain_slowly(stop)
+    blob = b"S" * (4 << 20)  # far more than the slow drain can take in time
+
+    outcome: list[BaseException] = []
+    returned = threading.Event()
+
+    def writer():
+        try:
+            session.write(blob)
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(exc)
+        finally:
+            returned.set()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    time.sleep(0.3)
+    assert not returned.is_set(), "the write finished; the test proves nothing"
+
+    session._serial.cancel_write()
+    assert returned.wait(DEADLINE)
+    thread.join(DEADLINE)
+    time.sleep(0.2)
+    stop.set()
+    pump.join(DEADLINE)
+    pty.drain_rest()
+
+    assert len(outcome) == 1 and isinstance(outcome[0], SessionError), outcome
+    message = str(outcome[0])
+    assert "at least" in message, \
+        f"an aborted write must not claim an exact boundary: {message}"
+
+    reported = int(re.search(r"at least (\d+) of", message).group(1))
+    # The measurement that makes the wording necessary rather than cautious:
+    # more bytes physically reached the target than the count names.
+    assert len(pty.received) > reported, (
+        f"reported at least {reported}, target received {len(pty.received)} "
+        "-- expected the count to under-report"
+    )
+    assert len(pty.received) < len(blob)
+
+
+def test_a_concurrent_open_during_a_close_is_told_why_it_failed(manager, pty):
+    """The window `last_close_warning` exists for is the one it must cover.
+
+    `close` frees the slot under the manager lock and shuts down outside it.
+    An `open` arriving in between gets past the one-session check and then
+    fails on the port's exclusive lock. Clearing the warning to None at the
+    top of `close` left that open with a bare EAGAIN -- exactly what the hint
+    was added to prevent.
+    """
+    session = open_ok(manager, pty)
+    closed = threading.Event()
+
+    def closer():
+        try:
+            manager.close(session.id)
+        finally:
+            closed.set()
+
+    with session._write_lock:  # stalls _shutdown where an in-flight write would
+        thread = threading.Thread(target=closer, daemon=True)
+        thread.start()
+        time.sleep(0.2)
+        assert not closed.is_set(), "close did not stall; the test proves nothing"
+        assert manager.current is None, "the slot must already be free"
+
+        assert manager.last_close_warning is not None, \
+            "nothing published to explain a failure inside this window"
+        with pytest.raises(SessionError) as e:
+            open_ok(manager, pty)
+        message = str(e.value)
+        assert pty.by_id in message
+        assert session.id in message, \
+            "the failure must name the session still holding the port"
+        assert "clos" in message, f"no mention of the close in flight: {message}"
+
+    assert closed.wait(DEADLINE)
+    thread.join(DEADLINE)
+    # Once the shutdown really finishes, a clean close leaves no warning behind.
+    assert manager.last_close_warning is None
+    assert can_open_exclusively(os.path.realpath(pty.by_id))
 
 
 def test_close_does_not_hold_the_manager_lock_across_the_shutdown(manager, pty):
