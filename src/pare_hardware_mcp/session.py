@@ -69,11 +69,15 @@ READ_CHUNK = 4096
 # worker -- the operator must always be able to let go of the port.
 JOIN_TIMEOUT = 2.0
 
-# `close` must not pull the fd out from under an in-flight `write`, so it waits
-# for `_write_lock`. `write` is bounded by the port's `write_timeout` (5s below)
-# and `cancel_write()` aborts it sooner, so this is slack on a bound that should
-# already have fired -- it exists only so that a `write_timeout` of None could
-# never leave the operator unable to let go of the port.
+# How long `close` waits for `_write_lock` before it stops waiting *in the
+# caller's thread*. It never stops waiting altogether: on expiry the close is
+# handed to a daemon thread that waits without a bound, because the fd must not
+# be released while a write is inside it. A leaked fd costs one port until the
+# worker restarts -- visible, and recoverable by restarting. Delivering one
+# session's bytes to the next session's board is neither. With `_closing` set
+# before the acquire, queued writers refuse instantly instead of each starting a
+# fresh `write_timeout`, so only one in-flight write can ever be outstanding and
+# this bound should not be reachable.
 WRITE_DRAIN_TIMEOUT = 6.0
 
 FLOW_MODES = ("none", "rtscts", "xonxoff")
@@ -131,6 +135,11 @@ class ConsoleSession:
         self._alive = True
         self._death_reason: str | None = None
         self._closed = False
+        # Set before `_shutdown` queues for `_write_lock`, so a writer waiting
+        # on that lock refuses the moment it gets in rather than starting a
+        # fresh `write_timeout`. Without it, N queued writers extend the close
+        # by N * write_timeout and the drain bound means nothing.
+        self._closing = threading.Event()
         self._stop = threading.Event()
         self._reader = threading.Thread(
             target=self._read_forever,
@@ -249,8 +258,11 @@ class ConsoleSession:
         between the check passing and the write starting.
         """
         with self._write_lock:
-            if self._closed:
-                raise SessionError(f"session {self.id} is closed")
+            if self._closed or self._closing.is_set():
+                raise SessionError(
+                    f"session {self.id} is closing or closed; nothing was "
+                    "written"
+                )
             if not self.alive:
                 raise SessionError(
                     f"session {self.id} is not alive, refusing to write: "
@@ -262,7 +274,7 @@ class ConsoleSession:
                 # rtscts against a target that never asserts CTS it blocks the
                 # tool call for as long as the target stays silent. The bytes
                 # are in the kernel's tty buffer either way.
-                self._serial.write(data)
+                written = self._serial.write(data)
             except serial.SerialTimeoutException as exc:
                 # NOT a death. `SerialTimeoutException` subclasses
                 # `SerialException` (serialutil.py:96), so lumping it in with
@@ -289,6 +301,23 @@ class ConsoleSession:
                     f"write on session {self.id} failed: {self.death_reason}"
                 ) from exc
 
+            # pyserial's `cancel_write()` abort path is
+            # `os.read(pipe_abort_write_r, 1000); break` followed by
+            # `return length - len(d)` (serialposix.py:632-634, 662) -- it
+            # raises nothing and reports the short count in its return value.
+            # Discarding that value would let a `console_send` racing a
+            # `console_close` return success having put zero bytes on the wire,
+            # telling a language model its command reached the board when
+            # nothing did. On a hardware console a false report about physical
+            # state is the worst thing this worker can do.
+            if written != len(data):
+                raise SessionError(
+                    f"write on session {self.id} was aborted after "
+                    f"{written} of {len(data)} bytes (the session is being "
+                    "closed). The target received only that prefix; assume "
+                    "the command did not take effect."
+                )
+
     def _shutdown(self) -> str | None:
         """Stop the reader, release the port, discard the capture.
 
@@ -297,6 +326,10 @@ class ConsoleSession:
         vanish.
         """
         warnings: list[str] = []
+        # Before anything else, and before queueing for `_write_lock`: a writer
+        # already waiting on that lock must refuse when it gets in rather than
+        # begin a new `write_timeout` behind us.
+        self._closing.set()
         self._stop.set()
         for cancel in (self._serial.cancel_read, self._serial.cancel_write):
             try:
@@ -324,25 +357,49 @@ class ConsoleSession:
         # console_close arriving as concurrent tool calls.
         acquired = self._write_lock.acquire(timeout=WRITE_DRAIN_TIMEOUT)
         try:
-            if not acquired:
+            if acquired:
+                self._release_port()
+            else:
+                # Do NOT close the fd here. A write is still inside
+                # `serial.write()`, which re-reads `self.fd` every iteration,
+                # and closing now is precisely the harm the lock exists to
+                # prevent -- the next `open` can be handed the same fd number.
+                # Hand the close to a daemon that waits without a bound: the
+                # port stays held until the write really finishes, and the next
+                # `open` on this device fails loudly on the exclusive lock
+                # rather than quietly writing to the wrong board.
+                threading.Thread(
+                    target=self._release_port_when_drained,
+                    name=f"console-drain-{self.id}",
+                    daemon=True,
+                ).start()
                 warnings.append(
                     f"a write on session {self.id} was still in flight after "
-                    f"{WRITE_DRAIN_TIMEOUT}s; releasing the port anyway"
+                    f"{WRITE_DRAIN_TIMEOUT}s, so {self.device.by_id} is still "
+                    "held and will be released when that write returns. The "
+                    "session is over; re-opening this device may fail until "
+                    "then."
                 )
-            try:
-                self._serial.close()
-            except Exception:  # noqa: BLE001 -- an unplugged fd fails to close;
-                pass           # the session is over and must not hang here
             with self._state_lock:
                 self._alive = False
-            # Set inside `_write_lock` so a `write` waiting on it sees a closed
-            # session the moment it gets in, rather than writing to a dead fd.
             self._closed = True
             self._buffer = None
         finally:
             if acquired:
                 self._write_lock.release()
         return "; ".join(warnings) if warnings else None
+
+    def _release_port(self) -> None:
+        """Close the fd. The caller must hold `_write_lock`."""
+        try:
+            self._serial.close()
+        except Exception:  # noqa: BLE001 -- an unplugged fd fails to close; the
+            pass           # session is over either way and must not hang here
+
+    def _release_port_when_drained(self) -> None:
+        """Wait for the in-flight write, however long it takes, then close."""
+        with self._write_lock:
+            self._release_port()
 
     def describe(self) -> dict:
         """The session half of `status()`. Every value derived, none cached."""
@@ -502,9 +559,15 @@ class SessionManager:
         try:
             port.open()
         except (serial.SerialException, OSError) as exc:
+            hint = ""
+            if self.last_close_warning:
+                # Otherwise this surfaces to a language model as a bare EAGAIN
+                # immediately after a successful close, with nothing to connect
+                # the two.
+                hint = f" (the last close reported: {self.last_close_warning})"
             raise SessionError(
                 f"could not open {resolved.by_id} (tty {resolved.tty}) at "
-                f"{baud} baud: {exc}"
+                f"{baud} baud: {exc}{hint}"
             ) from exc
         return port
 
@@ -522,9 +585,19 @@ class SessionManager:
     def close(self, session_id: str) -> None:
         """End the session: stop the reader, release the port, drop the capture.
 
-        The only thing that ends a session. Everything happens under the
-        manager lock so a concurrent `open` cannot claim the slot while the
-        port is still being released.
+        The only thing that ends a session.
+
+        The slot is freed under the manager lock; the shutdown itself runs
+        outside it. `_shutdown` can wait seconds -- up to `JOIN_TIMEOUT` for
+        the reader and `WRITE_DRAIN_TIMEOUT` for an in-flight write -- and
+        `status`, `get` and `open` are all tool calls that would otherwise
+        queue behind it.
+
+        The cost is that a *concurrent* `open` on the same device, arriving
+        between the slot being freed and the port being released, fails on the
+        exclusive lock. That is loud, and `last_close_warning` explains it; a
+        sequential close-then-open is unaffected, because `_shutdown` has
+        returned before `close` does.
         """
         with self._lock:
             current = self._current
@@ -533,8 +606,9 @@ class SessionManager:
                     f"no such session: {session_id} "
                     f"(open session: {current.id if current else 'none'})"
                 )
-            self.last_close_warning = current._shutdown()
             self._current = None
+            self.last_close_warning = None
+        self.last_close_warning = current._shutdown()
 
     def status(self) -> dict:
         """Session state. Valid with nothing open -- that is an answer, not an error.

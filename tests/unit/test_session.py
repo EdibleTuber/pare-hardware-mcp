@@ -25,7 +25,8 @@ import serial
 
 from pare_hardware_mcp.devices import DeviceError
 from pare_hardware_mcp.ringbuffer import CaptureBuffer
-from pare_hardware_mcp.session import ConsoleSession, SessionError, SessionManager
+from pare_hardware_mcp.session import (WRITE_DRAIN_TIMEOUT, ConsoleSession,
+                                        SessionError, SessionManager)
 
 TIGARD = "usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if01-port0"
 SERIAL = "TG1119e7"
@@ -677,49 +678,216 @@ def drain(pty, rounds: int = 50) -> None:
         rounds -= 1
 
 
-def test_close_waits_for_an_in_flight_write_before_releasing_the_port(manager, pty, second_pty):
-    """A write still in the port when `close` lands must not outlive the fd.
+def _instrument(session):
+    """Count writers inside `serial.write()`, and snapshot that at `close()`.
 
-    pyserial's `write` re-reads `self.fd` on every loop iteration
-    (serialposix.py:621) and `close` sets it to None and closes it
-    unconditionally (serialposix.py:529-541). Close the fd underneath a
-    blocked writer and the next session's `open` can be handed the same fd
-    number -- at which point session A's bytes are transmitted to session B's
-    physical target.
+    The contract is not "close waits a while", it is "the fd is not released
+    while a writer is inside the port". This measures exactly that.
+    """
+    state = {"inflight": 0, "peak": 0, "inflight_at_close": None, "closed": False}
+    guard = threading.Lock()
+    real_write, real_close = session._serial.write, session._serial.close
+
+    def counting_write(data):
+        with guard:
+            state["inflight"] += 1
+            state["peak"] = max(state["peak"], state["inflight"])
+        try:
+            return real_write(data)
+        finally:
+            with guard:
+                state["inflight"] -= 1
+
+    def counting_close():
+        with guard:
+            state["inflight_at_close"] = state["inflight"]
+            state["closed"] = True
+        return real_close()
+
+    session._serial.write = counting_write
+    session._serial.close = counting_close
+    return state
+
+
+def test_concurrent_writes_and_a_close_never_release_the_fd_under_a_writer(
+        manager, pty, second_pty):
+    """Three writers, not one -- one writer cannot show the real failure.
+
+    `write` consults the session's closing state only *after* it holds
+    `_write_lock`, so without a flag set before `close` queues for that lock,
+    every writer waiting on it starts a fresh `write_timeout` behind the
+    closer. Three of them outlast any bound `close` could reasonably wait, and
+    the fd is then released with a writer still inside `serial.write()` -- at
+    which point the next `open` can be handed the same fd number and this
+    session's bytes go to the next session's board.
     """
     session = open_ok(manager, pty)
+    state = _instrument(session)
+
     raised: list[tuple[str, str]] = []
     finished = threading.Event()
+    done = 0
+    tally = threading.Lock()
 
     def writer():
+        nonlocal done
         try:
             session.write(WEDGE)
         except BaseException as exc:  # noqa: BLE001 -- the type is the assertion
             raised.append((type(exc).__name__, str(exc)))
         finally:
-            finished.set()
+            with tally:
+                done += 1
+                if done == 3:
+                    finished.set()
 
-    thread = threading.Thread(target=writer, daemon=True)
-    thread.start()
-    time.sleep(0.2)
-    assert not finished.is_set(), "the write was not wedged; the test proves nothing"
+    threads = [threading.Thread(target=writer, daemon=True) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    time.sleep(0.3)
+    assert not finished.is_set(), "the writes were not wedged; the test proves nothing"
 
+    started = time.monotonic()
     manager.close(session.id)
+    elapsed = time.monotonic() - started
 
-    # The discriminating assertion: close must not return while a write is
-    # still inside the port.
-    assert finished.is_set(), \
-        "close released the port with a write still in flight"
+    # The assertion the whole fix exists for.
+    assert state["closed"], "the port was never closed"
+    assert state["inflight_at_close"] == 0, (
+        f"the fd was released with {state['inflight_at_close']} writer(s) "
+        "inside serial.write()"
+    )
+    # The drain bound must not have been reached: queued writers refuse
+    # instantly once the session is closing, so only one write is outstanding.
+    assert manager.last_close_warning is None, manager.last_close_warning
+    assert elapsed < WRITE_DRAIN_TIMEOUT, f"close took {elapsed:.2f}s"
 
-    thread.join(DEADLINE)
-    assert all(kind == "SessionError" for kind, _ in raised), \
-        f"write must fail as SessionError or not at all, got {raised}"
+    assert finished.wait(DEADLINE)
+    for thread in threads:
+        thread.join(DEADLINE)
 
-    # And the harm that race causes: session A's bytes on session B's target.
+    # Non-vacuous by construction: assert the list is populated before
+    # asserting anything about its contents. Every writer must have been told
+    # it did not write, one way or another.
+    assert len(raised) == 3, raised
+    assert all(kind == "SessionError" for kind, _ in raised), raised
+
+    # And the harm: the closed session's bytes must never reach the next board.
     later = open_ok(manager, second_pty)
     assert b"S" not in second_pty.recv(0.2), \
         "bytes from the closed session reached the next session's target"
     assert later.alive
+
+
+def test_a_write_outlasting_the_drain_bound_leaks_the_port_rather_than_stealing_it(
+        manager, pty, monkeypatch):
+    """The branch fix (a) makes unreachable, tested directly anyway.
+
+    If a write somehow outlasts the drain bound, `close` must NOT release the
+    fd: the next `open` could be handed the same fd number and this session's
+    bytes would go to the next board. Leaking the port until the write really
+    finishes is strictly safer -- a held port is visible and recoverable by
+    restarting the worker; writing to the wrong physical target is neither.
+    """
+    import pare_hardware_mcp.session as session_module
+    monkeypatch.setattr(session_module, "WRITE_DRAIN_TIMEOUT", 0.2)
+
+    session = open_ok(manager, pty)
+    state = _instrument(session)
+
+    with session._write_lock:  # stands in for a write that will not finish
+        manager.close(session.id)
+
+        assert not state["closed"], \
+            "close released the fd with the write lock held by someone else"
+        assert manager.last_close_warning is not None
+        assert pty.by_id in manager.last_close_warning, \
+            "the warning must name the port that is still held"
+        assert manager.current is None, "the session is over regardless"
+
+    # ...and once the write finishes, the port is released without being asked.
+    until(lambda: state["closed"], what="the drain thread to release the port")
+    assert can_open_exclusively(os.path.realpath(pty.by_id))
+
+
+def test_a_cancelled_write_is_not_reported_as_a_successful_send(manager, pty):
+    """`cancel_write()` aborts pyserial's write loop and raises NOTHING.
+
+    serialposix.py:632-634 is `os.read(pipe_abort_write_r, 1000); break`, and
+    :662 is `return length - len(d)` -- the short count comes back in the
+    return value. Discard it and a send that put zero bytes on the wire
+    reports success to a language model, which is a false claim about the
+    physical state of a board.
+    """
+    session = open_ok(manager, pty)
+    outcome: list[tuple[str, str]] = []
+    returned = threading.Event()
+
+    def writer():
+        try:
+            session.write(WEDGE)
+            outcome.append(("returned", "no exception"))
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append((type(exc).__name__, str(exc)))
+        finally:
+            returned.set()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    assert not returned.is_set(), "the write was not wedged; the test proves nothing"
+
+    session._serial.cancel_write()
+    assert returned.wait(DEADLINE)
+    thread.join(DEADLINE)
+
+    assert len(outcome) == 1
+    kind, message = outcome[0]
+    assert kind == "SessionError", f"an aborted write reported success: {outcome}"
+    # Say how much actually went out, not just that something went wrong.
+    assert str(len(WEDGE)) in message, message
+    # An abort is not a device failure.
+    assert session.alive is True
+    assert session.death_reason is None
+
+
+def test_close_does_not_hold_the_manager_lock_across_the_shutdown(manager, pty):
+    """`status`, `get` and `open` are tool calls; `close` can wait seconds.
+
+    Ordering, not duration: `status()` must return while `close` is still
+    inside `_shutdown`. Holding the manager lock across the shutdown makes
+    that impossible.
+    """
+    session = open_ok(manager, pty)
+    closed = threading.Event()
+    failures: list[BaseException] = []
+
+    def closer():
+        try:
+            manager.close(session.id)
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+        finally:
+            closed.set()
+
+    with session._write_lock:  # stalls _shutdown exactly where a write would
+        thread = threading.Thread(target=closer, daemon=True)
+        thread.start()
+        time.sleep(0.2)
+        assert not closed.is_set(), "close did not stall; the test proves nothing"
+
+        status = manager.status()  # must not queue behind the stalled close
+        assert not closed.is_set(), \
+            "status() only returned after close did -- the manager lock was " \
+            "held across the shutdown"
+        assert set(status) == set(SessionManager.STATUS_KEYS)
+        with pytest.raises(KeyError):
+            manager.get(session.id)
+
+    assert closed.wait(DEADLINE)
+    thread.join(DEADLINE)
+    assert not failures, failures
+    assert manager.current is None
 
 
 def test_write_after_close_is_refused(manager, pty):
