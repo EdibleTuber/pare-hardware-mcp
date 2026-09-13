@@ -2083,6 +2083,92 @@ def test_an_early_exit_that_never_fires_spends_the_whole_budget(manager, pty):
     assert calls, "the predicate was never consulted"
 
 
+def test_listen_seconds_accumulates_across_sweeps_not_just_the_last_dwell(manager, pty):
+    """`listen_seconds` is the honesty guarantee for unequal sampling.
+
+    A sweep gives candidates different amounts of evidence -- a rate reached
+    on every pass has many dwells' worth, one the budget ran out before has
+    one -- and `listen_seconds` is the only thing in the result that says
+    so. If it reported the LAST dwell instead of the total it would read
+    0.2s for a rate the bench listened to for over a second, and every
+    candidate would look equally sampled.
+
+    Asserted as a relationship -- at least one dwell for each COMPLETED
+    sweep -- rather than against a measured duration, so it survives a
+    change to the rate list, the dwell, or the budget. `sweeps` counts
+    completed passes only, and a rate is dwelt on once per completed pass
+    (rejected rates leave `pending`, and there are none here), so the bound
+    holds exactly rather than approximately.
+
+    Would catch (verified): `listened[rate] = time.monotonic() - dwell_start`
+    in place of the accumulating form.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    pump = threading.Thread(
+        target=lambda: [pty.send(b"U-Boot 2017.09\r\n") or time.sleep(0.005)
+                        for _ in iter(lambda: not stop.is_set(), False)],
+        daemon=True)
+    pump.start()
+    rates = (9600, 115200, 230400)
+    dwell, budget = 0.1, 1.2
+    try:
+        result = session.scan_baud(rates, dwell, no_op_decide,
+                                   budget_seconds=budget)
+    finally:
+        stop.set()
+    pump.join(timeout=DEADLINE)
+
+    assert result["sweeps"] >= 3, (
+        "a single-sweep scan cannot distinguish accumulating from "
+        f"overwriting (swept {result['sweeps']})")
+    assert result["rejected"] == {}
+    for rate in rates:
+        assert result["listen_seconds"][rate] >= result["sweeps"] * dwell, (
+            f"{rate} was dwelt on in each of {result['sweeps']} completed "
+            f"sweeps but reports only {result['listen_seconds'][rate]}s -- "
+            "the last dwell, not the total")
+
+
+def test_the_time_listened_accounts_for_the_whole_sampling_budget(manager, pty):
+    """The same guarantee from the other side: nothing goes unaccounted.
+
+    Every second of the scan's sampling is spent inside one candidate's
+    dwell, so the `listen_seconds` values must SUM to the budget, not to one
+    sweep. Bounded by one sweep either way rather than by a tolerance typed
+    in seconds: the deadline is checked before each candidate, so the scan
+    can overrun by at most the dwell in flight, and the only time it spends
+    outside a dwell is the per-candidate `baudrate`/`reset_input_buffer`
+    pair.
+
+    Would catch (verified) the same overwrite mutation as the test above --
+    the total collapses to roughly one sweep -- and also `listen_seconds`
+    populated for only the rates reached on the final pass.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    pump = threading.Thread(
+        target=lambda: [pty.send(b"U-Boot 2017.09\r\n") or time.sleep(0.005)
+                        for _ in iter(lambda: not stop.is_set(), False)],
+        daemon=True)
+    pump.start()
+    rates = (9600, 115200, 230400)
+    dwell, budget = 0.1, 1.2
+    try:
+        result = session.scan_baud(rates, dwell, no_op_decide,
+                                   budget_seconds=budget)
+    finally:
+        stop.set()
+    pump.join(timeout=DEADLINE)
+
+    one_sweep = len(rates) * dwell
+    total = sum(result["listen_seconds"].values())
+    assert set(result["listen_seconds"]) == set(rates)
+    assert budget - one_sweep <= total <= budget + one_sweep, (
+        f"listened for {total}s in total against a {budget}s budget "
+        f"(bound: one sweep, {one_sweep}s, either side)")
+
+
 def test_a_default_budget_is_exactly_one_sweep(manager, pty):
     """The single-pass shape survives as the degenerate case of the sweep,
     so the coordination tests above it exercise the same code path rather
@@ -2132,6 +2218,153 @@ def test_a_rate_the_hardware_refuses_is_not_retried_on_every_sweep(manager, pty)
         f"the refused rate was re-applied {attempts.count(333333)} times "
         f"across {result['sweeps']} sweeps")
     assert 333333 not in result["samples"]
+
+
+def _baudrate_spy(session, refuse):
+    """Install a `baudrate` descriptor that consults `refuse(value)`.
+
+    Returns `(attempts, applied, restore)`: every value assignment is
+    appended to `attempts`, every value the port actually TOOK is appended
+    to `applied`, and `restore()` puts the real descriptor back. `refuse`
+    returning a string makes that assignment raise `ValueError` with it --
+    pyserial's own shape for a rate the kernel would not take -- without
+    the port moving.
+    """
+    cls = type(session._serial)
+    real = cls.baudrate
+    attempts: list[int] = []
+    applied: list[int] = []
+
+    class Spy:
+        def __get__(self, obj, owner=None):
+            return real.__get__(obj, owner)
+
+        def __set__(self, obj, value):
+            attempts.append(value)
+            reason = refuse(value)
+            if reason:
+                raise ValueError(reason)
+            real.__set__(obj, value)
+            applied.append(value)
+
+    cls.baudrate = Spy()
+    return attempts, applied, lambda: setattr(cls, "baudrate", real)
+
+
+def test_a_rate_refused_on_a_later_sweep_is_dropped_from_the_ranking(manager, pty):
+    """A refusal on sweep 3 must retract the sample sweep 1 collected.
+
+    Before sweeping, `rejected[rate] = ...; continue` ran BEFORE `samples`
+    was ever written for that rate, so a refused rate could not be ranked.
+    Sweeping separates the two: the rate applies on sweep 1, accumulates
+    bytes, and is refused later -- leaving a rate the port has just refused
+    sitting in the dict `decide` picks from, and letting the tool report
+    `winner: N` and `rejected: [{rate: N}]` in one response.
+
+    Asserted as a relationship -- `samples` and `rejected` are disjoint, and
+    `decide` is offered only what is in `samples` -- rather than against the
+    particular rate, so it still means something if the rate list changes.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    pump = threading.Thread(
+        target=lambda: [pty.send(b"U-Boot 2017.09\r\n") or time.sleep(0.005)
+                        for _ in iter(lambda: not stop.is_set(), False)],
+        daemon=True)
+    pump.start()
+    seen = {115200: 0}
+
+    def refuse(value):
+        if value != 115200:
+            return None
+        seen[115200] += 1
+        # Fine for the first two sweeps, refused from the third on: the
+        # transient case, which is the only way bytes and a refusal can
+        # both exist for one rate.
+        return "transient kernel refusal" if seen[115200] >= 3 else None
+
+    offered = {}
+
+    def decide(samples):
+        offered.update(samples)
+        return max(samples, key=lambda r: len(samples[r])) if samples else None
+
+    attempts, _applied, restore = _baudrate_spy(session, refuse)
+    try:
+        result = session.scan_baud((9600, 115200, 230400), 0.1, decide,
+                                   budget_seconds=1.2)
+    finally:
+        restore()
+        stop.set()
+    pump.join(timeout=DEADLINE)
+
+    assert result["sweeps"] >= 3, (
+        "the refusal must land on a later sweep than the sample for this "
+        f"test to mean anything (swept {result['sweeps']})")
+    assert 115200 in result["rejected"]
+    assert not set(result["samples"]) & set(result["rejected"]), (
+        "a rate cannot be both ranked evidence and a refusal: "
+        f"{set(result['samples']) & set(result['rejected'])}")
+    assert not set(offered) & set(result["rejected"]), (
+        "`decide` was offered a rate the port had already refused")
+    assert result["winner"] not in result["rejected"]
+    assert session.baud == result["final_baud"] == session._serial.baudrate
+
+
+def test_a_winner_the_port_will_not_take_is_never_reported_as_left_live(manager, pty):
+    """`self.baud` follows the port, not this method's intent.
+
+    The restore used to assign `self.baud = final_baud` OUTSIDE the try that
+    applies it, so an apply that raised left the session claiming a rate the
+    line was not at -- while `winner` and `final_baud` claimed it too. The
+    guarantee in `scan_baud`'s docstring is that the port is left at a known
+    rate AND `self.baud` matches it; this is the case where the two used to
+    part company.
+
+    Note the refusal here is at RESTORE time only, so it is independent of
+    the rejected-rate path above: the winner sampled cleanly and the device
+    went away (or the kernel balked) between the last dwell and the restore.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    scanning = {"done": False}
+
+    def refuse(value):
+        # Only once the sweep is over, and only for the winner: the fallback
+        # to the session's original rate must still succeed, because that is
+        # what makes "a KNOWN rate" true.
+        if scanning["done"] and value == 115200:
+            return "the port will not take it now"
+        return None
+
+    attempts, _applied, restore = _baudrate_spy(session, refuse)
+
+    def decide(samples):
+        scanning["done"] = True
+        return 115200
+
+    try:
+        # Three rates, and the winner is the MIDDLE one, so the rate the
+        # sweep happens to leave in the termios struct is not the winner:
+        # without the fallback the port is left wherever the last dwell put
+        # it while `self.baud` claims the winner -- the reviewer's pty
+        # reproduction exactly.
+        result = session.scan_baud((9600, 115200, 230400), 0.1, decide,
+                                   budget_seconds=0.9)
+    finally:
+        restore()
+
+    assert 115200 in attempts[-2:], "the restore never tried the winner"
+    assert session._serial.baudrate == 9600, (
+        "the port must be left at the session's original rate when the "
+        "winner will not apply")
+    assert session.baud == session._serial.baudrate, (
+        f"session.baud claims {session.baud} but the port is at "
+        f"{session._serial.baudrate}")
+    assert result["final_baud"] == session._serial.baudrate
+    assert result["winner"] is None, (
+        "a rate that could not be left live is not a winner -- reporting it "
+        "makes winner/final_baud/restored contradict each other")
+    assert result["restored"] is True
 
 
 def test_a_sweep_still_records_exactly_one_capture_gap(manager, pty):

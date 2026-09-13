@@ -522,7 +522,16 @@ class ConsoleSession:
         (the winner, or the rate the session started at) and `self.baud`
         matches it -- a bad-but-in-range candidate that pyserial itself
         rejects must never leave the line at whatever tcsetattr last
-        applied while `self.baud` still claims something else.
+        applied while `self.baud` still claims something else. A rate that
+        lands in `"rejected"` is therefore also dropped from `"samples"`,
+        even if an earlier sweep had already collected bytes at it --
+        otherwise `decide` could crown a rate the port has since refused.
+        And `self.baud`, `"final_baud"` and `"winner"` are all derived from
+        the rate the port ACCEPTED, not the one this method asked for: if
+        the winner will not apply the session's original rate is tried, and
+        if that will not apply either (the device is gone) `"final_baud"`
+        names the last rate the port did take. `"winner"` is non-None only
+        when that rate was actually left live.
 
         Pausing the reader for the scan means capture stops advancing for
         the whole scan budget or more -- a real gap in the boot log a caller
@@ -610,6 +619,12 @@ class ConsoleSession:
             # rather than leaving the port at whatever the failed candidate
             # left in the termios struct.
             final_baud = original_baud
+            # The rate the PORT last accepted, as distinct from the rate this
+            # method intends it to be at. They diverge exactly when a
+            # `baudrate` assignment raises, which is the one case where
+            # `self.baud` must not simply be told what `final_baud` says --
+            # see the restore in the `finally` below.
+            applied_baud = original_baud
             gap_start_time: float | None = None
             gap_entry: dict | None = None
 
@@ -682,6 +697,10 @@ class ConsoleSession:
                                 break
                             try:
                                 self._serial.baudrate = rate
+                                # Recorded on the line AFTER the assignment
+                                # that can raise, so it only ever names a
+                                # rate the port really took.
+                                applied_baud = rate
                                 # Discard whatever is sitting in the
                                 # driver's input queue from the PREVIOUS
                                 # candidate rate (or from before the scan
@@ -723,6 +742,24 @@ class ConsoleSession:
                                 # call re-learning the same refusal every
                                 # pass.
                                 rejected[rate] = str(exc)
+                                # Sweeping makes the refusal and the sample
+                                # arrive on DIFFERENT passes: a rate that
+                                # applied fine on sweep 1 has bytes in
+                                # `samples` by the time a transient refusal
+                                # on sweep 3 lands it in `rejected`. Left
+                                # there, `decide` could crown a rate the
+                                # port has just refused to be set to, and
+                                # the restore below would silently fall
+                                # back while `winner` still named it. A rate
+                                # the hardware refuses is not a candidate to
+                                # be left live, whatever it said earlier, so
+                                # its sample leaves the ranking with it.
+                                # This also keeps `samples` and `rejected`
+                                # DISJOINT, which is what makes tools.py's
+                                # `len(samples) + len(rejected)` a true
+                                # count of candidates attempted rather than
+                                # one that can exceed the number requested.
+                                samples.pop(rate, None)
                                 continue
 
                             collected = samples.setdefault(rate, bytearray())
@@ -802,12 +839,39 @@ class ConsoleSession:
                     # else. `final_baud` defaults to `original_baud` (set
                     # before the try), so a bad candidate mid-loop restores
                     # the rate the session started at.
-                    try:
-                        self._serial.baudrate = final_baud
-                        self._serial.reset_input_buffer()
-                    except Exception:  # noqa: BLE001 -- best effort; the
-                        pass          # device may already be gone
-                    self.baud = final_baud
+                    #
+                    # Two rates are tried, not one: if the winner itself
+                    # will not apply -- the device went away between the
+                    # last dwell and here, or the kernel refused it on this
+                    # attempt having taken it earlier -- falling back to the
+                    # rate the session opened at is the only remaining
+                    # KNOWN rate. `dict.fromkeys` so the common case where
+                    # they are the same rate costs one termios call, not
+                    # two.
+                    for candidate in dict.fromkeys((final_baud, original_baud)):
+                        try:
+                            self._serial.baudrate = candidate
+                            self._serial.reset_input_buffer()
+                        except Exception:  # noqa: BLE001 -- best effort; the
+                            continue      # device may already be gone
+                        applied_baud = candidate
+                        break
+                    # `self.baud` is assigned from what the port ACCEPTED,
+                    # never from what this method wanted. The old
+                    # unconditional `self.baud = final_baud` sat outside the
+                    # try, so a restore that raised left the session
+                    # claiming a rate the line was not at -- the exact thing
+                    # the "left at a KNOWN rate and `self.baud` matches it"
+                    # guarantee above exists to rule out.
+                    if winner is not None and applied_baud != winner:
+                        # By this method's own contract a returned `winner`
+                        # is "left live". It is not, so it is not a winner:
+                        # reporting one the port is not at would make
+                        # `winner`/`final_baud`/`restored` mutually
+                        # contradictory in a single result.
+                        winner = None
+                    final_baud = applied_baud
+                    self.baud = applied_baud
             finally:
                 self._scan_pause.clear()
                 # Guarded on `gap_entry`, NOT `gap_start_time`: the latter is
