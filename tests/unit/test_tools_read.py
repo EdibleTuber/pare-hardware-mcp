@@ -7,34 +7,51 @@ import json
 import pytest
 
 from pare_hardware_mcp import tools
+from pare_hardware_mcp.ringbuffer import (CaptureBuffer, DEFAULT_READ_LIMIT,
+                                          MAX_READ_LIMIT)
+
+
+class FakeSession:
+    id = "s-1"
+    alive = True
+    baud = 115200
+    flow = "none"
+
+    def __init__(self, capacity=1024):
+        self.buffer = CaptureBuffer(capacity=capacity)
+        self.gaps = []
+
+    def gaps_overlapping(self, start_cursor, end_cursor):
+        return [dict(g) for g in self.gaps
+                if start_cursor <= g["at_cursor"] <= end_cursor]
+
+
+class FakeManager:
+    def __init__(self, capacity=1024):
+        self.current = FakeSession(capacity=capacity)
+
+    def get(self, session_id):
+        if session_id != self.current.id:
+            raise KeyError(session_id)
+        return self.current
 
 
 @pytest.fixture
 def live(monkeypatch):
     """A session manager whose buffer is pre-loaded, with no real device."""
-    from pare_hardware_mcp.ringbuffer import CaptureBuffer
-
-    class FakeSession:
-        id = "s-1"
-        alive = True
-        baud = 115200
-        flow = "none"
-        def __init__(self):
-            self.buffer = CaptureBuffer(capacity=1024)
-            self.gaps = []
-        def gaps_overlapping(self, start_cursor, end_cursor):
-            return [dict(g) for g in self.gaps
-                    if start_cursor <= g["at_cursor"] <= end_cursor]
-
-    class FakeManager:
-        def __init__(self):
-            self.current = FakeSession()
-        def get(self, session_id):
-            if session_id != self.current.id:
-                raise KeyError(session_id)
-            return self.current
-
     mgr = FakeManager()
+    monkeypatch.setattr(tools, "MANAGER", mgr)
+    return mgr
+
+
+@pytest.fixture
+def big(monkeypatch):
+    """The same, with a buffer comfortably larger than MAX_READ_LIMIT.
+
+    Sized from the constant rather than a literal so it stays larger than the
+    ceiling if the ceiling ever moves.
+    """
+    mgr = FakeManager(capacity=4 * MAX_READ_LIMIT)
     monkeypatch.setattr(tools, "MANAGER", mgr)
     return mgr
 
@@ -129,3 +146,99 @@ async def test_console_status_serialises_none_rts_as_json_null(monkeypatch):
     assert '"rts": null' in raw
     out = json.loads(raw)
     assert out["rts"] is None
+
+
+# --------------------------------------------------------------------------
+# The payload bound. Before this, `limit` had no default and no ceiling: one
+# unbounded console_read against a filled 64 MiB buffer measured 89.5 MB of
+# JSON in 514 ms. `remaining`/`next_cursor` are what make a bound safe --
+# draining across several calls is the designed path.
+# --------------------------------------------------------------------------
+
+async def test_a_default_read_is_bounded_not_the_whole_buffer(big):
+    """Catches `limit: int | None = None` reaching the buffer as None.
+
+    A handler that passes the caller's absent limit straight through returns
+    everything, which is exactly the pre-fix behaviour.
+    """
+    big.current.buffer.append(b"x" * (3 * MAX_READ_LIMIT))
+    out = json.loads(await tools.console_read(session="s-1", cursor=0))
+    data = base64.b64decode(out["data_b64"])
+    assert len(data) == DEFAULT_READ_LIMIT
+    assert out["limit_applied"] == DEFAULT_READ_LIMIT
+    assert out["remaining"] == 3 * MAX_READ_LIMIT - DEFAULT_READ_LIMIT
+
+
+async def test_a_limit_above_the_ceiling_is_clamped(big):
+    """Catches a default with no clamp: a caller can still ask for everything."""
+    big.current.buffer.append(b"y" * (3 * MAX_READ_LIMIT))
+    out = json.loads(await tools.console_read(
+        session="s-1", cursor=0, limit=10_000_000))
+    data = base64.b64decode(out["data_b64"])
+    assert len(data) == MAX_READ_LIMIT
+    assert out["limit_applied"] == MAX_READ_LIMIT
+    assert out["remaining"] > 0
+
+
+async def test_a_limit_under_the_ceiling_is_honoured_exactly(big):
+    """Catches a clamp written as a constant rather than a min(): a handler
+    that always returns MAX_READ_LIMIT would pass the test above and fail
+    here."""
+    big.current.buffer.append(b"z" * (3 * MAX_READ_LIMIT))
+    out = json.loads(await tools.console_read(session="s-1", cursor=0, limit=10))
+    assert len(base64.b64decode(out["data_b64"])) == 10
+    assert out["limit_applied"] == 10
+
+
+async def test_a_bounded_read_still_drains_completely_via_next_cursor(big):
+    """The bound must not cost the caller any bytes.
+
+    Asserted as a relationship -- every byte appended comes back, in order,
+    across however many calls `remaining` says are needed -- rather than
+    against a call count, which would break on the next legitimate change to
+    either constant. Catches a clamp that advances `next_cursor` past the
+    bytes it did not return.
+    """
+    payload = bytes(range(256)) * ((DEFAULT_READ_LIMIT * 3) // 256)
+    big.current.buffer.append(payload)
+
+    collected = bytearray()
+    cursor = 0
+    for _ in range(1000):                       # bounded so a bug cannot hang
+        out = json.loads(await tools.console_read(session="s-1", cursor=cursor))
+        collected.extend(base64.b64decode(out["data_b64"]))
+        cursor = out["next_cursor"]
+        assert out["dropped"] == 0
+        if out["remaining"] == 0:
+            break
+    else:
+        pytest.fail("remaining never reached 0")
+    assert bytes(collected) == payload
+
+
+async def test_a_non_integer_limit_is_an_error_not_a_transport_failure(live):
+    """Catches `min(limit, ...)` on a non-int: TypeError is not caught by the
+    handler's `except KeyError`/`except CursorError`, so it escapes the
+    {"error": ...} contract entirely."""
+    live.current.buffer.append(b"hello")
+    out = json.loads(await tools.console_read(
+        session="s-1", cursor=0, limit="4096"))
+    assert out["error"]
+    assert "limit" in out["error"]
+
+
+async def test_a_negative_limit_is_normalised_to_zero_and_reported_as_zero(live):
+    """Catches `max(0, ...)` being dropped from `_read_limit`.
+
+    The returned BYTES are not the discriminator here -- `CaptureBuffer.read`
+    has its own `max(0, ...)` and would clamp a negative to an empty read
+    either way -- so asserting only on `data_b64` would be a test that passes
+    against both implementations. `limit_applied` is produced by `_read_limit`
+    itself and is what actually distinguishes them: -5 in, 0 reported.
+    """
+    live.current.buffer.append(b"0123456789")
+    out = json.loads(await tools.console_read(
+        session="s-1", cursor=0, limit=-5))
+    assert base64.b64decode(out["data_b64"]) == b""
+    assert out["limit_applied"] == 0
+    assert out["remaining"] == 10

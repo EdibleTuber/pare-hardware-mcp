@@ -22,7 +22,8 @@ from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_SAMPLE_SECONDS,
                                     rank_candidates, sanitize_rates)
 from pare_hardware_mcp.config import load_config
 from pare_hardware_mcp.devices import list_serial_devices
-from pare_hardware_mcp.ringbuffer import CursorError
+from pare_hardware_mcp.ringbuffer import (CursorError, DEFAULT_READ_LIMIT,
+                                          MAX_READ_LIMIT)
 from pare_hardware_mcp.session import SessionError, SessionManager
 
 CONFIG = load_config()
@@ -44,14 +45,43 @@ def _err(message: str) -> str:
     return json.dumps({"error": message})
 
 
+def _read_limit(limit: int | None) -> int:
+    """`limit` as a BOUNDED byte count. Never `None`, never unbounded.
+
+    `CaptureBuffer.read` keeps `limit=None` meaning "everything"; that is
+    correct for an in-process caller and stays as it is. This is the tool
+    boundary, where the result is base64 in JSON bound for a language model's
+    context: an unbounded default read of a full 64 MiB buffer measured 89.5
+    MB and 514 ms. `remaining`/`next_cursor` already let a caller drain across
+    several calls, so a ceiling costs nothing that was not already supported.
+
+    A non-integer `limit` is refused rather than clamped: `min("4096", n)`
+    raises `TypeError`, which no caller-facing except clause here catches, so
+    it would escape the `{"error": ...}` contract as an opaque transport
+    failure. The input schema says integer, but this worker's bind address is
+    its only access control -- the schema is not a guarantee.
+    """
+    if limit is None:
+        return DEFAULT_READ_LIMIT
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise ValueError(
+            f"limit must be an integer number of bytes, got {limit!r}"
+        )
+    return max(0, min(limit, MAX_READ_LIMIT))
+
+
 async def console_read(session: str, cursor: int = 0,
                        limit: int | None = None) -> str:
+    try:
+        capped = _read_limit(limit)
+    except ValueError as exc:
+        return _err(str(exc))
     try:
         sess = MANAGER.get(session)
     except KeyError:
         return _err(f"no such session {session!r}")
     try:
-        data, next_cursor, dropped, remaining = sess.buffer.read(cursor, limit)
+        data, next_cursor, dropped, remaining = sess.buffer.read(cursor, capped)
     except CursorError:
         # `cursor` is negative or ahead of `head`: not a position this API
         # ever handed out, so it can never be a legitimate "fell behind"
@@ -66,9 +96,15 @@ async def console_read(session: str, cursor: int = 0,
     # so this byte-contiguous stream does not read as an unbroken one to
     # whatever -- a language model, most likely -- consumes it next.
     capture_gaps = sess.gaps_overlapping(next_cursor - len(data), next_cursor)
+    # `limit_applied` is how a caller learns the ceiling from a RESPONSE and
+    # not only from the tool description: it asked for 10 MB, it got
+    # MAX_READ_LIMIT, and `remaining` says the rest is still there. Without
+    # it, a clamp is indistinguishable from a buffer that happened to hold
+    # exactly that much.
     return _ok(session=session,
                data_b64=base64.b64encode(data).decode("ascii"),
                next_cursor=next_cursor, dropped=dropped, remaining=remaining,
+               limit_applied=capped,
                alive=sess.alive, capture_gaps=capture_gaps)
 
 

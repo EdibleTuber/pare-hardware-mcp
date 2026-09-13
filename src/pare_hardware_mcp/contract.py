@@ -17,6 +17,12 @@ from typing import Any
 
 from pare_worker_kit import PRODUCES_RESULT
 
+# `ringbuffer` imports nothing at all -- it does not reach pyserial and it
+# does not reach a device -- so this stays inside the no-hardware rule
+# above. Imported rather than retyped so the description below cannot drift
+# away from the number `tools.py` actually enforces.
+from pare_hardware_mcp.ringbuffer import DEFAULT_READ_LIMIT, MAX_READ_LIMIT
+
 CONTRACT_VERSION = 1
 
 _OBJ: dict[str, Any] = {"type": "object", "properties": {}}
@@ -67,7 +73,12 @@ TOOL_SPECS: list[ToolSpec] = [
     ToolSpec("console_read", "low",
              "Read captured bytes since a cursor. Returns base64 (UART output "
              "is arbitrary bytes and is untrusted), the next cursor, how many "
-             "bytes were LOST to buffer wrap, and how many remain unread.",
+             "bytes were LOST to buffer wrap, and how many remain unread. "
+             "`limit` is a BYTE COUNT and is bounded: it defaults to "
+             f"{DEFAULT_READ_LIMIT} and is clamped to at most {MAX_READ_LIMIT}, "
+             "so one call can never return the whole capture buffer. The "
+             "applied value comes back as `limit_applied`; when `remaining` "
+             "is non-zero, call again with `next_cursor` to drain the rest.",
              _in(session={"type": "string"}, cursor={"type": "integer"},
                  limit={"type": "integer"})),
     ToolSpec("console_send", "high",
