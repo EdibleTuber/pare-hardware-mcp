@@ -254,6 +254,85 @@ async def test_read_on_a_session_closed_underneath_it_keeps_the_error_contract(m
     assert "discarded" in out["error"]
 
 
+async def test_open_reports_the_cursor_capture_had_already_reached(monkeypatch):
+    """`cursor` is not decorative and is not always 0.
+
+    Capture starts inside `SessionManager.open` -- the reader thread is
+    running before it returns -- so by the time a response is built the
+    buffer can already hold the first bytes of a boot log. `cursor` is the
+    offset a reader must start from to get everything after that point, and a
+    wrong one silently re-reads or skips the start of the capture.
+
+    Every other fake in this suite has `head = 0`, which is why mutating
+    `cursor=sess.buffer.head` to `cursor=0` survived the whole suite: the one
+    line carrying round 2's Critical was untested in both respects. This is
+    the other respect.
+    """
+    class FakeSession:
+        id = "s-1"
+        class device:
+            by_id, serial = "/dev/x", "SN-9"
+        baud, flow, dtr, rts = 115200, "none", False, False
+        class buffer:
+            head = 4096
+
+    class FakeManager:
+        def open(self, **kwargs): return FakeSession()
+
+    monkeypatch.setattr(tools, "MANAGER", FakeManager())
+    monkeypatch.setattr(tools, "CONFIG", Config(device="/dev/x", expect_serial=None))
+    out = json.loads(await tools.console_open())
+    assert out["cursor"] == 4096
+
+
+async def test_open_racing_a_close_keeps_the_error_contract(monkeypatch):
+    """Round 2's Critical, and it was introduced by round 1's own fix.
+
+    `cursor=sess.buffer.head` sat OUTSIDE console_open's `except Exception`,
+    and `ConsoleSession.buffer` raises `SessionError` once `_shutdown` has set
+    `_buffer = None` (session.py:188-193, :806). Before `MANAGER.open` moved
+    to a thread there was no await between the open and that line, so it was
+    unreachable; adding the await is what made it reachable.
+    `SessionManager.open` publishes `_current` under the manager lock
+    (session.py:951) BEFORE the thread returns, so a concurrent
+    console_status can reveal the new id and a console_close on it can land
+    in the window.
+
+    The fake reproduces the post-`_shutdown` state exactly -- the property
+    raising -- rather than racing a real close, so this tests the handler's
+    contract and not the scheduler.
+
+    Would catch (and does catch, verified against 89d63fa) the read being
+    taken on the event loop outside the try: the await raises `SessionError`
+    straight out of the tool instead of returning JSON.
+    """
+    class ClosedUnderneathSession:
+        id = "s-2"
+        class device:
+            by_id, serial = "/dev/x", "SN-9"
+        baud, flow, dtr, rts = 115200, "none", False, False
+
+        @property
+        def buffer(self):
+            raise SessionError(
+                "session s-2 is closed and its capture was discarded")
+
+    class FakeManager:
+        def open(self, **kwargs): return ClosedUnderneathSession()
+
+    monkeypatch.setattr(tools, "MANAGER", FakeManager())
+    monkeypatch.setattr(tools, "CONFIG", Config(device="/dev/x", expect_serial=None))
+
+    out = json.loads(await tools.console_open())
+    # Not an error: the port really was opened, and every other field is
+    # still true. What is gone is the capture.
+    assert "error" not in out
+    assert out["session"] == "s-2"
+    assert out["cursor"] is None
+    # ...and the null is explained rather than left to be inferred.
+    assert "console_status" in out["note"]
+
+
 async def test_a_send_racing_a_close_keeps_the_error_contract(monkeypatch):
     """`write` refuses inside `_write_lock` once `_closing` is set. That
     refusal is a `SessionError` and must reach the caller as JSON, not as a

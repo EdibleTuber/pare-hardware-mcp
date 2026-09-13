@@ -117,6 +117,49 @@ async def test_read_does_not_flag_a_gap_outside_the_returned_window(live):
     # A read that starts after the gap must not report it either.
     out = json.loads(await tools.console_read(session="s-1", cursor=7))
     assert out["capture_gaps"] == []
+    # Neither half above distinguishes the shipped window expression from
+    # `(cursor, next_cursor)` -- nothing was dropped, so the two are equal.
+    # The test below is the one that does.
+
+
+async def test_read_does_not_flag_a_gap_in_the_bytes_it_could_not_return(live):
+    """The window starts where the DATA starts, not where the caller asked.
+
+    `gaps_overlapping(next_cursor - len(data), next_cursor)` and
+    `gaps_overlapping(cursor, next_cursor)` are identical whenever
+    `dropped == 0`, which is every other gap test in this file -- so the
+    mutation survived the whole suite. They diverge exactly when the caller
+    fell behind and the ring wrapped: `cursor` then points into the evicted
+    region, and the mutated expression reports gaps sitting among bytes the
+    caller never received and cannot receive. A language model told "there was
+    a 12-second hole in what you just read" about bytes that are not in its
+    hands reasons about a boot log it does not have.
+
+    Pre-existing, but BL1's default limit makes short reads the norm rather
+    than the exception, so the expression is materially more load-bearing than
+    when it was written.
+
+    Would catch `(cursor, next_cursor)` and `(0, next_cursor)`.
+    """
+    capacity = live.current.buffer.capacity          # 1024
+    live.current.buffer.append(b"x" * (capacity + 476))
+    # head = 1500, oldest retained = 476: offsets 0..475 are gone for good.
+    gap_in_the_evicted_region = {"at_cursor": 100, "duration_s": 12.0,
+                                 "reason": "baud scan"}
+    live.current.gaps.append(gap_in_the_evicted_region)
+
+    out = json.loads(await tools.console_read(session="s-1", cursor=0))
+    assert out["dropped"] == 476, "the fixture must actually evict"
+    assert out["next_cursor"] - len(base64.b64decode(out["data_b64"])) == 476
+    assert out["capture_gaps"] == [], \
+        "a gap among the dropped bytes is not a gap in what was returned"
+
+    # ...and the same gap IS reported once a read's window covers it. Asserted
+    # as the pair so the test cannot pass by never reporting anything.
+    live.current.gaps.append({"at_cursor": 600, "duration_s": 3.0,
+                              "reason": "baud scan"})
+    out = json.loads(await tools.console_read(session="s-1", cursor=0))
+    assert [g["at_cursor"] for g in out["capture_gaps"]] == [600]
 
 
 async def test_read_with_an_invalid_cursor_returns_an_error_not_an_exception(live):

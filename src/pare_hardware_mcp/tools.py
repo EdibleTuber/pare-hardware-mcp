@@ -65,6 +65,35 @@ MANAGER = SessionManager(capacity=CONFIG.buffer_bytes)
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 
 
+def _open_session(**kwargs):
+    """`MANAGER.open`, plus the opening cursor, taken in the SAME thread.
+
+    `buffer.head` belongs with the open, not with the response: capture starts
+    inside `open()` (the reader thread is running before it returns), so this
+    is the cursor a reader gets if it starts now, and it is not always 0.
+    Reading it back on the event loop after `to_thread` returned put it on the
+    far side of an await from the open that produced it -- and
+    `SessionManager.open` publishes `_current` under the manager lock
+    (session.py:951) BEFORE the thread returns, so a concurrent console_status
+    can reveal the new id and a console_close on it can land in that window.
+    `ConsoleSession.buffer` then raises `SessionError` (session.py:188-193,
+    :806) from outside console_open's try, escaping the {"error": ...}
+    contract on exactly the race moving open to a thread created.
+
+    Narrowing the window is not the same as closing it -- a close can still
+    land between `MANAGER.open` returning and the next line -- so the read is
+    also guarded. `None` is the honest answer there and matches what
+    `describe()` already reports for the same state (`buffer is not None`,
+    session.py:826-831); console_open was the outlier in not being defensive
+    about it.
+    """
+    sess = MANAGER.open(**kwargs)
+    try:
+        return sess, sess.buffer.head
+    except SessionError:
+        return sess, None
+
+
 def _manager_current():
     """`MANAGER.current` as a callable, so it can be handed to a thread.
 
@@ -224,21 +253,35 @@ async def console_open(device: str | None = None, baud: int = 115200,
         # already covered DeviceError, SessionError and anything pyserial
         # raises, and `to_thread` re-raises in this frame, so nothing about
         # which exceptions reach it changes.
-        sess = await asyncio.to_thread(
-            MANAGER.open, device=device, expect_serial=CONFIG.expect_serial,
+        sess, cursor = await asyncio.to_thread(
+            _open_session, device=device, expect_serial=CONFIG.expect_serial,
             baud=baud, flow=flow, dtr=dtr, rts=rts)
     except Exception as exc:                      # noqa: BLE001 - surface it
         return _err(str(exc))
+    note = ("target voltage is set by a physical switch on the Tigard "
+            "and is not readable from software")
+    if cursor is None:
+        # Told, not left to be inferred from a null. Everything else in this
+        # response is still true -- the port WAS opened -- so this is not an
+        # error; it is a session that did not survive to the response.
+        note += (". The capture for this session was already discarded when "
+                 "this response was built -- a close landed between the port "
+                 "opening and now, so `cursor` is null and this session id "
+                 "will not resolve. Call console_status before reading.")
     # Report the lines we asserted -- and, for rts, what the session actually
     # did rather than what was requested. Under flow="rtscts" pyserial never
     # applies a requested RTS, so `sess.rts` is `None` there; `json.dumps`
     # serialises that as `null`, never coerced to `false` -- this line resets
     # target boards, so a false claim about it is a real defect.
+    #
+    # `cursor` comes from `_open_session`, taken in the same thread as the
+    # open: every other field here is a plain attribute that cannot raise,
+    # and `sess.buffer.head` was the one that could -- from outside this
+    # function's try, on the race that moving the open to a thread created.
     return _ok(session=sess.id, device=sess.device.by_id,
                serial=sess.device.serial, baud=sess.baud, flow=sess.flow,
-               dtr=sess.dtr, rts=sess.rts, cursor=sess.buffer.head,
-               note="target voltage is set by a physical switch on the Tigard "
-                    "and is not readable from software")
+               dtr=sess.dtr, rts=sess.rts, cursor=cursor,
+               note=note)
 
 
 async def console_send(session: str, data_b64: str) -> str:

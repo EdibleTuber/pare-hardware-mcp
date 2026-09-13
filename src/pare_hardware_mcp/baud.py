@@ -29,7 +29,28 @@ _PRINTABLE = frozenset(
 
 
 def score_sample(data: bytes) -> dict:
-    """Evidence about whether `data` looks like console output at this rate."""
+    """Evidence about whether `data` looks like console output at this rate.
+
+    KNOWN GAP -- `framing_errors` IS SPECIFIED AND IS NOT MEASURED HERE.
+    The spec asks for a `framing_errors` count alongside these fields;
+    `nulls` went in instead, and the substitution was never recorded anywhere
+    a reader of this function would find it. Nothing in this package claims
+    framing errors are measured, so this is a missing statement rather than a
+    false one -- but it is missing from the one place it matters.
+
+    Deferred rather than guessed: a framing-error count is only useful with a
+    threshold, and calibrating one needs a real adapter against a real target
+    with a deliberately floated ground. A number invented at a desk here
+    would be exactly the confident-and-wrong verdict this module exists to
+    avoid.
+
+    The consequence, while it is absent: `printable_ratio` is the ONLY
+    discriminator `WIRING_SUSPECT_PRINTABLE_MAX` has, which is part of why
+    that constant is set where it is -- see its docstring. A real
+    framing-error count is what would finally separate "the ground is
+    floating" from "the rate is wrong", which `printable_ratio` provably
+    cannot.
+    """
     if not data:
         return {"printable_ratio": 0.0, "has_crlf": False, "nulls": 0}
     printable = sum(1 for b in data if b in _PRINTABLE)
@@ -107,6 +128,10 @@ It is deliberately NOT the complement of `WINNER_PRINTABLE_THRESHOLD`:
 "nothing scored well enough to win" (anything under 0.85) is the ordinary
 outcome of a scan that simply missed the right rate, and firing on every one
 of those would train a caller to ignore the hint.
+
+This bar carries more weight than it should have to, because the spec's
+`framing_errors` field was never implemented -- see `score_sample`. Until it
+is, `printable_ratio` is the only discriminator this hint has.
 
 Which way to err was decided by the costs. A false positive costs an
 operator one look at a ground wire. A false negative is the defect this
