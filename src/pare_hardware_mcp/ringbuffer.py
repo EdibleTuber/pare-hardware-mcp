@@ -38,6 +38,32 @@ from __future__ import annotations
 # rederive from (baud / 10) bytes/sec.
 DEFAULT_CAPACITY = 64 * 1024 * 1024  # 64 MiB
 
+# How many bytes ONE `console_read` returns when the caller does not say, and
+# the hard ceiling on what it may ask for. Derived from the same 11 520 B/s
+# (115200 baud, 8N1) the capacity above is derived from.
+#
+# `CaptureBuffer.read` keeps `limit=None` meaning "everything" -- that is the
+# right default for a library whose caller is in-process. The bound belongs at
+# the tool boundary (`tools.py`), where the result is JSON, base64-inflated by
+# 4/3, and lands in a language model's context: an unbounded read of a full
+# buffer produced an 89.5 MB result in 514 ms.
+#
+# 16 KiB default: ~1.42 s of continuous full-rate output, ~200 lines of
+# 80-column console text, ~21.8 KiB once base64'd. A caller polling a live
+# console more often than about once a second never falls behind in a single
+# call, and nothing about the common case needs a limit argument at all.
+#
+# 256 KiB ceiling: ~22.8 s of continuous full-rate output. A typical boot log
+# is 15-60 s (170-675 KB), so a caller that deliberately raises `limit` lifts
+# one in 1-3 calls; a panic loop takes a few more. `remaining` and
+# `next_cursor` are what make that safe -- draining across several calls is
+# the designed path, not a workaround. The ratio to the default (16x) is wider
+# than pare-frida-mcp's 5x for `_EVENT_LIMIT_MAX` because the unit here is
+# bytes off a wire rather than discrete events, so the drain case is real
+# rather than pathological.
+DEFAULT_READ_LIMIT = 16 * 1024      # 16 KiB
+MAX_READ_LIMIT = 256 * 1024         # 256 KiB
+
 
 class CursorError(ValueError):
     """A cursor that was never a valid position was requested.

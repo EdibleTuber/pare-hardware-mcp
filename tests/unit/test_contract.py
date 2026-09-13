@@ -56,3 +56,13 @@ def test_the_contract_imports_without_pyserial():
 
 def test_contract_version_is_declared():
     assert CONTRACT_VERSION >= 1
+
+
+def test_console_read_states_its_payload_bound_in_the_description():
+    # A model that cannot see the ceiling asks for the whole buffer and gets a
+    # silently truncated answer. Asserted against the constants tools.py
+    # enforces, not against literals, so the two cannot drift apart.
+    from pare_hardware_mcp.ringbuffer import DEFAULT_READ_LIMIT, MAX_READ_LIMIT
+    spec = next(s for s in TOOL_SPECS if s.name == "console_read")
+    assert str(DEFAULT_READ_LIMIT) in spec.description
+    assert str(MAX_READ_LIMIT) in spec.description

@@ -29,7 +29,28 @@ _PRINTABLE = frozenset(
 
 
 def score_sample(data: bytes) -> dict:
-    """Evidence about whether `data` looks like console output at this rate."""
+    """Evidence about whether `data` looks like console output at this rate.
+
+    KNOWN GAP -- `framing_errors` IS SPECIFIED AND IS NOT MEASURED HERE.
+    The spec asks for a `framing_errors` count alongside these fields;
+    `nulls` went in instead, and the substitution was never recorded anywhere
+    a reader of this function would find it. Nothing in this package claims
+    framing errors are measured, so this is a missing statement rather than a
+    false one -- but it is missing from the one place it matters.
+
+    Deferred rather than guessed: a framing-error count is only useful with a
+    threshold, and calibrating one needs a real adapter against a real target
+    with a deliberately floated ground. A number invented at a desk here
+    would be exactly the confident-and-wrong verdict this module exists to
+    avoid.
+
+    The consequence, while it is absent: `printable_ratio` is the ONLY
+    discriminator `WIRING_SUSPECT_PRINTABLE_MAX` has, which is part of why
+    that constant is set where it is -- see its docstring. A real
+    framing-error count is what would finally separate "the ground is
+    floating" from "the rate is wrong", which `printable_ratio` provably
+    cannot.
+    """
     if not data:
         return {"printable_ratio": 0.0, "has_crlf": False, "nulls": 0}
     printable = sum(1 for b in data if b in _PRINTABLE)
@@ -73,14 +94,93 @@ the whole capture -- this keeps the tool result compact for every candidate
 rate at once rather than only the winner.
 """
 
+WIRING_SUSPECT_PRINTABLE_MAX = 0.5
+"""Below this `printable_ratio`, a candidate is not "a worse rate" -- it is
+evidence that nothing on this line resembled text at that speed.
+
+Three reference points fix it, and the gaps between them are wide:
+
+- A floating ground, or TX/RX swapped, yields high-bit noise or nothing:
+  `printable_ratio` 0.0. (Reproduced against a pty fed `bytes(range(128,
+  256))` -- a floating ground's signature -- where every candidate scored
+  0.0.)
+- A merely WRONG rate reframes real traffic into approximately uniform
+  bytes. 100 of the 256 byte values are in `string.printable`, so that
+  lands near 0.39.
+- Real console text scores > 0.9, and `WINNER_PRINTABLE_THRESHOLD` (0.85)
+  is the bar it must clear to be left live.
+
+0.5 sits ABOVE the wrong-rate expectation, so both the 0.0 case and the
+0.39 case fall under it -- and that is the point, not an accident. Those two
+are precisely the pair `score_sample` cannot tell apart, which is the whole
+reason the hint exists: framing errors from a floating ground and a rate
+that reframes real traffic produce the same shape of evidence. A scan where
+every candidate lands in that band has not established which one it is, and
+`DEFAULT_RATES` already covers every common console speed, so "the rate list
+was wrong" is the less likely half of the pair by the time all eight have
+failed.
+
+What 0.5 keeps OUT is the marginal candidate: 0.6-0.84 is plausible text
+with some corruption -- a rate near the right one, worth retrying -- and
+that must not draw a wiring accusation.
+
+It is deliberately NOT the complement of `WINNER_PRINTABLE_THRESHOLD`:
+"nothing scored well enough to win" (anything under 0.85) is the ordinary
+outcome of a scan that simply missed the right rate, and firing on every one
+of those would train a caller to ignore the hint.
+
+This bar carries more weight than it should have to, because the spec's
+`framing_errors` field was never implemented -- see `score_sample`. Until it
+is, `printable_ratio` is the only discriminator this hint has.
+
+Which way to err was decided by the costs. A false positive costs an
+operator one look at a ground wire. A false negative is the defect this
+constant exists to fix: the scan confidently blames the rate, and the
+operator spends the next hour on rates while the fault is the wire. The
+ranked evidence is in the same response either way -- this only ever ADDS a
+`hint`, it never replaces a verdict or changes a score.
+"""
+
 GROUND_CROSSOVER_HINT = (
-    "no bytes arrived at any candidate rate. Before trying more rates, check: "
+    "Before trying more rates, check the wiring: "
     "(1) ground is connected between the adapter and the target -- a floating "
-    "ground produces framing errors that look exactly like a wrong baud rate; "
+    "ground produces framing errors that look exactly like a wrong baud rate, "
+    "so the scan cannot tell the two apart and will otherwise blame the rate; "
     "(2) TX/RX are not swapped -- the adapter's TX must reach the target's RX "
     "and vice versa."
 )
-"""Invariant 6: a silent line names physical causes, not just "try more rates"."""
+"""Invariant 6: name the physical causes, rather than just "try more rates".
+
+Deliberately says nothing about WHICH symptom was observed -- the verdict and
+its note carry that -- because the two symptoms that warrant it are different
+and only one of them is silence. A wrong crossover just produces silence,
+which `no_data_at_any_rate` already reports honestly; a floating ground
+produces framing errors that score exactly like a wrong baud rate, and that
+is the case where the hint changes what an operator does.
+"""
+
+
+def all_scored_poorly(samples: dict[int, bytes]) -> bool:
+    """True when EVERY candidate scored below `WIRING_SUSPECT_PRINTABLE_MAX`.
+
+    The condition invariant 6's hint is really about. A floating ground
+    produces framing errors, framing errors look exactly like a wrong baud
+    rate to `score_sample`, and the ranking will otherwise hand back a
+    confident "no candidate rate looked like clean console text" that sends
+    the operator off to try more rates while the fault is a wire.
+
+    An empty `samples` is NOT "everything scored poorly" -- nothing was
+    scored at all. That case is `all_silent`, or `all_candidate_rates_
+    rejected` when every rate was refused before a byte could be read, and
+    both have their own verdict; `all(...)` over an empty dict would return
+    True and quietly annex them.
+    """
+    if not samples:
+        return False
+    return all(
+        score_sample(data)["printable_ratio"] < WIRING_SUSPECT_PRINTABLE_MAX
+        for data in samples.values()
+    )
 
 
 class BaudScanError(RuntimeError):

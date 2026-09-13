@@ -511,10 +511,21 @@ class ConsoleSession:
         real duration when the scan ends, whatever the reason. Returned here
         as `"gap"`.
 
+        A candidate's read loop makes the same by-id check `_read_forever`
+        makes on a quiet line: `udev` removes the symlink on unplug, so its
+        absence is positive evidence the adapter left the bus rather than an
+        inference from silence. Without it an unplugged adapter produces a
+        run of empty samples that score exactly like a line whose ground is
+        floating, and tools.py's wiring hint would be attached to a device
+        that is simply gone. `death_reason` is set, the candidate's sample is
+        still recorded, and the scan stops on the existing `if not
+        self.alive` check below it.
+
         Raises `SessionError` for a bad rate list, a session that is not
         alive, a reader that will not park, or a `decide` callback that
         raises -- always with the port left at a known rate. Does NOT raise
-        for a candidate rate the hardware rejects; see `"rejected"` above.
+        for a candidate rate the hardware rejects, nor for a device that dies
+        mid-scan; see `"rejected"` and `"death_reason"` above.
         """
         if not rates:
             raise SessionError("scan_baud: no candidate rates given")
@@ -640,6 +651,27 @@ class ConsoleSession:
                                 break
                             if chunk:
                                 collected.extend(chunk)
+                                continue
+                            # A quiet line is the same two-way ambiguity
+                            # `_read_forever` resolves, and it matters MORE
+                            # here: an empty sample is scored as evidence
+                            # about `rate`, and a scan whose every candidate
+                            # came back empty because the adapter left the
+                            # bus is indistinguishable, by score alone, from
+                            # one whose ground is floating. tools.py hands
+                            # the second case a wiring hint. Without this
+                            # check the first case gets it too -- an
+                            # operator told to inspect the ground on a
+                            # device that is simply gone.
+                            if not os.path.lexists(self.device.by_id):
+                                self._die(
+                                    f"device {self.device.by_id} disappeared "
+                                    f"during a baud scan at {rate}: the by-id "
+                                    f"path no longer resolves (was "
+                                    f"{self.device.tty}) and the line has gone "
+                                    "quiet"
+                                )
+                                break
                         samples[rate] = bytes(collected)
                         if not self.alive:
                             break

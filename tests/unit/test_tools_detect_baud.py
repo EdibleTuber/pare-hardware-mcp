@@ -17,6 +17,9 @@ import json
 import pytest
 
 from pare_hardware_mcp import tools
+from pare_hardware_mcp.baud import (WINNER_PRINTABLE_THRESHOLD,
+                                    WIRING_SUSPECT_PRINTABLE_MAX,
+                                    score_sample)
 
 
 class FakeSession:
@@ -172,7 +175,21 @@ async def test_a_winner_sample_round_trips_through_base64(monkeypatch):
     assert base64.b64decode(winning["sample_b64"]) == b"U-Boot\r\nhello\r\n"
 
 
-async def test_no_clear_winner_reports_the_restored_rate(monkeypatch):
+async def test_every_candidate_scoring_poorly_names_ground_and_crossover(monkeypatch):
+    """The blocker this file previously pinned the wrong way round.
+
+    `bytes(range(128, 256))` is a floating ground's signature -- high-bit
+    noise, `printable_ratio` 0.0 at every candidate. The hint used to be
+    gated on `all_silent(samples)` alone, so this case (bytes DID arrive,
+    none of them text-like) got "no candidate rate looked like clean console
+    text" and nothing else: the operator is sent off to try more rates while
+    the fault is a wire. Framing errors from a floating ground and a
+    mis-framed rate produce the same evidence, and `score_sample` cannot
+    separate them, which is exactly why the hint belongs here.
+
+    Would catch: the hint gated on silence, on `all_silent`, or on `not
+    samples`. The verdict and note are unchanged -- the hint is additive.
+    """
     result = {
         "samples": {9600: bytes(range(128, 256)), 115200: bytes(range(128, 256))},
         "rejected": {},
@@ -184,6 +201,167 @@ async def test_no_clear_winner_reports_the_restored_rate(monkeypatch):
     out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
     assert out["verdict"] == "no_clear_winner"
     assert "9600" in out["note"]
+    assert "ground" in out["hint"].lower()
+    assert "tx" in out["hint"].lower() and "rx" in out["hint"].lower()
+    # Ranked evidence still travels: the hint adds to the response, it does
+    # not stand in for the scores.
+    assert {c["rate"] for c in out["candidates"]} == {9600, 115200}
+    assert all(c["printable_ratio"] == 0.0 for c in out["candidates"])
+
+
+async def test_a_marginal_no_clear_winner_does_not_accuse_the_wiring(monkeypatch):
+    """The other side of the threshold, and the reason it is not 0.85.
+
+    These samples are mostly-printable text that simply did not clear
+    `WINNER_PRINTABLE_THRESHOLD` -- a rate near the right one, worth
+    retrying. Would catch: the hint attached to every `restored` verdict, or
+    a `WIRING_SUSPECT_PRINTABLE_MAX` raised to the winner threshold, which
+    would fire on every ordinary missed-rate scan and train a caller to
+    ignore it.
+    """
+    marginal = b"U-Boot 2021.01 \r\n" * 6 + bytes(range(128, 160))
+    ratio = score_sample(marginal)["printable_ratio"]
+    assert WIRING_SUSPECT_PRINTABLE_MAX < ratio < WINNER_PRINTABLE_THRESHOLD, ratio
+
+    result = {
+        "samples": {9600: marginal, 115200: marginal},
+        "rejected": {},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": True, "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert out["verdict"] == "no_clear_winner"
+    assert "hint" not in out
+
+
+async def test_one_readable_candidate_among_noise_does_not_accuse_the_wiring(monkeypatch):
+    """A mixed scan: one candidate is high-bit noise, the other is readable
+    enough to rule wiring out but not enough to win.
+
+    The pairing matters. A scan where SOME rate produced text-like bytes is
+    evidence the link works and the rate list is what needs widening -- the
+    opposite of the wiring case. Would catch `any(...)` written where
+    `all(...)` belongs: the noise candidate alone would then be enough to
+    accuse the wire. (A mixed scan with an outright WINNER would not catch
+    that mutation, because the hint branch is never reached on the winner
+    path -- which is why this fixture is deliberately `restored: True`.)
+    """
+    marginal = b"U-Boot 2021.01 \r\n" * 6 + bytes(range(128, 160))
+    assert (WIRING_SUSPECT_PRINTABLE_MAX
+            < score_sample(marginal)["printable_ratio"]
+            < WINNER_PRINTABLE_THRESHOLD)
+    result = {
+        "samples": {9600: bytes(range(128, 256)), 115200: marginal},
+        "rejected": {},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": True, "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert out["verdict"] == "no_clear_winner"
+    assert "hint" not in out
+
+
+async def test_a_device_that_died_on_the_last_candidate_is_not_a_clean_verdict(monkeypatch):
+    """Every candidate WAS attempted, so the count-based `scan_aborted` check
+    does not fire -- but the link failed during the scan, and the samples the
+    dying candidates produced are evidence about a dead device.
+
+    Before this, the response carried `alive: False` and a `death_reason`
+    next to a completed verdict and the wiring hint: an operator told to
+    inspect the ground on an adapter that is simply gone. Would catch:
+    falling through to `no_data_at_any_rate`/`no_clear_winner`. The
+    companion test below is what catches the branch being gated on the racy
+    `alive` flag instead -- this one alone would not, since `alive` is False
+    here too.
+    """
+    gone = "device /dev/serial/by-id/usb-fake-if00-port0 disappeared during a baud scan at 115200"
+    result = {
+        "samples": {9600: b"boot\r\n", 115200: b""},
+        "rejected": {},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": False, "death_reason": gone, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert out["verdict"] == "scan_device_died"
+    assert gone in out["note"]
+    assert "hint" not in out, "a device that is gone must not draw a wiring hint"
+    assert out["death_reason"] == gone
+
+
+async def test_a_close_racing_the_response_does_not_read_as_a_device_death(monkeypatch):
+    """`alive` can read False for a session that never failed.
+
+    `scan_baud` reads `self.alive` after releasing `_write_lock` -- which is
+    exactly what a racing `_shutdown` was waiting on -- and `_shutdown` sets
+    `_alive = False` without ever touching `_death_reason` (session.py's
+    `_die` is the only writer of that). So a completed scan can hand back
+    `alive: False, death_reason: None`, and calling that a device death
+    would tell an operator their adapter failed when the daemon merely
+    closed the session.
+
+    Would catch: the new branch gated on `not result["alive"]` rather than
+    on `death_reason is not None`.
+    """
+    result = {
+        "samples": {9600: bytes(range(128, 256)),
+                    115200: b"U-Boot 2021.01\r\nHit any key\r\n"},
+        "rejected": {},
+        "original_baud": 9600, "final_baud": 115200, "restored": False,
+        "alive": False, "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert out["verdict"] == "winner"
+    assert out["alive"] is False
+
+
+async def test_a_device_that_died_after_silent_candidates_is_not_a_wiring_verdict(monkeypatch):
+    """The specific collision: every sample empty AND the device gone.
+
+    Silence alone is `no_data_at_any_rate` + the hint. Silence caused by an
+    adapter that left the bus is not a wiring question at all, and
+    `death_reason` is what tells them apart. Would catch: the death check
+    placed AFTER `all_silent` in the chain.
+    """
+    gone = "device /dev/serial/by-id/usb-fake-if00-port0 disappeared during a baud scan at 9600"
+    result = {
+        "samples": {9600: b"", 115200: b""},
+        "rejected": {},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": False, "death_reason": gone, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert out["verdict"] == "scan_device_died"
+    assert "hint" not in out
+
+
+async def test_an_aborted_scan_names_the_death_when_there_was_one(monkeypatch):
+    """The partial case keeps its count-based verdict but stops saying
+    "closing or disappeared" when it knows which. Would catch a death branch
+    placed BEFORE the attempted-vs-requested check, which would lose the
+    count."""
+    gone = "device /dev/x disappeared during a baud scan at 9600"
+    result = {
+        "samples": {9600: b""},
+        "rejected": {},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": False, "death_reason": gone, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200, 230400]))
+    assert out["verdict"] == "scan_aborted"
+    assert "1 of 3" in out["note"]
+    assert gone in out["note"]
     assert "hint" not in out
 
 

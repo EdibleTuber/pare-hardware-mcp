@@ -1575,6 +1575,48 @@ def test_a_hardware_rejected_rate_is_recorded_and_the_scan_continues(manager, pt
           what="capture to resume after the restore")
 
 
+def test_a_scan_notices_the_adapter_leaving_the_bus_on_a_quiet_line(manager, pty):
+    """The quiet unplug, during a scan rather than during capture.
+
+    `_read_forever` has always made this check; the scan's own read loop did
+    not. A pty that is never written to produces empty samples at every
+    candidate, which is byte-for-byte what a floating ground produces -- and
+    tools.py hands that case a wiring hint. So without this check an adapter
+    that is simply GONE draws "check the ground wire".
+
+    The reader thread cannot be what notices: it is parked for the whole
+    scan (`_scan_pause`), touching neither the port nor `os.path.lexists`.
+    The test waits for that park before unlinking, so the only code that can
+    set `death_reason` here is the scan's own loop.
+
+    Would catch: the by-id check omitted from the scan loop (death_reason
+    stays None and every sample comes back empty), or placed where a
+    non-empty chunk would skip it.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    result: dict = {}
+
+    def scan():
+        result["value"] = session.scan_baud((9600, 115200, 230400), 0.5,
+                                            no_op_decide)
+
+    thread = threading.Thread(target=scan, daemon=True)
+    thread.start()
+    until(lambda: session._scan_parked.is_set(),
+          what="the reader thread to park for the scan")
+
+    pty.unlink_by_id()
+    thread.join(timeout=DEADLINE)
+    assert not thread.is_alive(), "the scan did not return after the unplug"
+
+    value = result["value"]
+    assert value["death_reason"] is not None, \
+        "an unplugged adapter must not read back as a silent line"
+    assert pty.by_id in value["death_reason"]
+    assert "baud scan" in value["death_reason"]
+    assert value["alive"] is False
+
+
 def test_scan_baud_restores_the_original_rate_when_there_is_no_winner(manager, pty):
     session = open_ok(manager, pty, baud=9600)
     result = session.scan_baud((9600, 115200), 0.1, no_op_decide)
@@ -1765,6 +1807,74 @@ def test_a_concurrent_write_waits_for_the_scan_rather_than_racing_it(manager, pt
 
     scanner.join(DEADLINE)
     writer.join(DEADLINE)
+
+
+def test_a_send_waiting_on_the_scan_lock_does_not_stall_other_tool_calls(manager, pty, monkeypatch):
+    """The whole-worker version of the starvation fix, over the real lock.
+
+    Task 7 moved `scan_baud` off the event loop "so a concurrent low-tier
+    call (status, a read) is not starved for the whole scan". That is true of
+    the scan and was false of the worker: `console_send` waits on the same
+    `_write_lock` the scan holds, and `console_send` was inline, so the
+    starvation simply moved to whoever called it. Measured through the real
+    handlers over this pty before the fix: 3.78s blocked, 0 of the ~75 status
+    polls due in that window completed.
+
+    This test lives in test_session.py rather than with the other tools tests
+    because it needs the pty fixtures and a real `SessionManager` -- the fake
+    in test_tools_concurrency.py pins the same property deterministically,
+    while this one pins it against the actual lock the scan holds.
+
+    Would catch `sess.write(payload)` being re-inlined in tools.py: the probe
+    gets no control for the whole wait and ticks zero times.
+    """
+    import asyncio
+    import base64
+    import json
+
+    from pare_hardware_mcp import tools
+
+    monkeypatch.setattr(tools, "MANAGER", manager)
+    session = open_ok(manager, pty, baud=9600)
+
+    scan = threading.Thread(
+        target=lambda: session.scan_baud((9600, 115200, 230400), 0.5,
+                                         no_op_decide),
+        daemon=True)
+    scan.start()
+    until(lambda: session._scan_parked.is_set(),
+          what="the scan to take _write_lock and park the reader")
+
+    async def drive():
+        done = asyncio.Event()
+        ticks = {"n": 0}
+
+        async def probe():
+            while not done.is_set():
+                # A real low-tier tool call, not a bare sleep: the claim is
+                # that console_status still ANSWERS during the wait.
+                json.loads(await tools.console_status())
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(probe())
+        try:
+            raw = await tools.console_send(
+                session=session.id,
+                data_b64=base64.b64encode(b"reboot\r").decode())
+        finally:
+            done.set()
+            await task
+        return json.loads(raw), ticks["n"]
+
+    out, ticks = asyncio.run(drive())
+    scan.join(timeout=DEADLINE)
+
+    assert out.get("sent") == 7, out
+    # The send genuinely waits for the scan -- that is the design, and it is
+    # not what this test objects to. What it pins is that everything else
+    # kept answering while it waited.
+    assert ticks >= 10, f"console_status was starved during the send: {ticks}"
 
 
 def test_close_during_a_scan_aborts_it_promptly_rather_than_hanging(manager, pty):

@@ -5,7 +5,10 @@ import pytest
 
 from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_RATES,
                                     GROUND_CROSSOVER_HINT, MAX_BAUD_RATE,
-                                    all_silent, check_budget, pick_winner,
+                                    WINNER_PRINTABLE_THRESHOLD,
+                                    WIRING_SUSPECT_PRINTABLE_MAX,
+                                    all_scored_poorly, all_silent,
+                                    check_budget, pick_winner,
                                     rank_candidates, sanitize_rates,
                                     score_sample)
 
@@ -156,3 +159,58 @@ def test_all_silent_is_true_only_when_every_candidate_captured_nothing():
 def test_ground_crossover_hint_names_ground_and_crossover():
     assert "ground" in GROUND_CROSSOVER_HINT.lower()
     assert "tx" in GROUND_CROSSOVER_HINT.lower() and "rx" in GROUND_CROSSOVER_HINT.lower()
+
+
+# --------------------------------------------------------------------------
+# all_scored_poorly -- invariant 6's REAL condition. A floating ground
+# produces framing errors that score exactly like a wrong baud rate, so
+# "every candidate scored poorly" is the case where the hint changes what an
+# operator does; silence is the benign half that no_data_at_any_rate already
+# reports honestly.
+# --------------------------------------------------------------------------
+
+def test_high_bit_noise_at_every_rate_scores_poorly():
+    # A floating ground's signature. Would catch the predicate written
+    # against `has_crlf` or `nulls` rather than `printable_ratio`.
+    noise = bytes(range(128, 256))
+    assert all_scored_poorly({9600: noise, 115200: noise}) is True
+
+
+def test_one_clean_candidate_is_enough_to_clear_the_suspicion():
+    # Would catch `any(...)` written where `all(...)` belongs.
+    assert all_scored_poorly({9600: bytes(range(128, 256)), 115200: GOOD}) is False
+
+
+def test_the_suspicion_threshold_is_not_the_winner_threshold():
+    """An ordinary missed-rate scan must not read as a wiring fault.
+
+    Pinned as a RELATIONSHIP between the two constants rather than against
+    either value, so moving a threshold for a real reason does not break
+    this, but collapsing the two into one does. Would catch
+    WIRING_SUSPECT_PRINTABLE_MAX being set to WINNER_PRINTABLE_THRESHOLD,
+    which would fire the hint on every scan that simply missed the rate.
+    """
+    assert WIRING_SUSPECT_PRINTABLE_MAX < WINNER_PRINTABLE_THRESHOLD
+    # A sample in the band between them: too poor to win, too good to accuse
+    # the wiring.
+    marginal = b"U-Boot 2021.01 \r\n" * 6 + bytes(range(128, 160))
+    ratio = score_sample(marginal)["printable_ratio"]
+    assert WIRING_SUSPECT_PRINTABLE_MAX < ratio < WINNER_PRINTABLE_THRESHOLD
+    assert pick_winner({9600: marginal}) is None
+    assert all_scored_poorly({9600: marginal}) is False
+
+
+def test_an_empty_sample_set_is_not_annexed_by_the_poor_scoring_check():
+    """`all(...)` over an empty dict is True, which would let this predicate
+    claim the all-rates-rejected and nothing-sampled cases -- both of which
+    have their own verdict. Would catch the `if not samples` guard being
+    dropped."""
+    assert all_scored_poorly({}) is False
+
+
+def test_a_silent_candidate_set_still_scores_poorly():
+    """Empty samples score 0.0, so silence is a subset of "everything poor".
+    The two verdicts are separated in tools.py, by checking all_silent first
+    -- this pins that the predicate itself does not exclude it, so a future
+    reorder cannot silently drop the hint from a silent line."""
+    assert all_scored_poorly({9600: b"", 115200: b""}) is True
