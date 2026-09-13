@@ -17,8 +17,8 @@ import re
 from typing import Any
 
 from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_SAMPLE_SECONDS,
-                                    GROUND_CROSSOVER_HINT, all_silent,
-                                    check_budget, pick_winner,
+                                    GROUND_CROSSOVER_HINT, all_scored_poorly,
+                                    all_silent, check_budget, pick_winner,
                                     rank_candidates, sanitize_rates)
 from pare_hardware_mcp.config import load_config
 from pare_hardware_mcp.devices import list_serial_devices
@@ -269,6 +269,15 @@ async def console_detect_baud(device: str | None = None,
     )
     requested = len(candidate_rates)
     attempted = len(samples) + len(result["rejected"])
+    # `death_reason` is the one liveness signal in this result that is NOT
+    # racy, and it is why `alive` is still not consulted here. `_die` is the
+    # only thing that ever sets it, and `_die` is only reached from a real
+    # read/write/ioctl failure or a by-id path that stopped resolving --
+    # whereas `_shutdown` sets `_alive = False` on a perfectly healthy
+    # session (session.py:763-764) without touching `_death_reason`. So a
+    # non-None `death_reason` means the DEVICE failed, never "a close was
+    # racing this response".
+    death_reason = result["death_reason"]
     if attempted < requested:
         # The loop stopped early (session.py: _stop/_closing observed
         # mid-scan -- a concurrent close, or the device disappearing) before
@@ -282,11 +291,31 @@ async def console_detect_baud(device: str | None = None,
         # verdict: falling through to "all candidates rejected" or "no data"
         # below would claim every candidate was tried when most never were.
         response["verdict"] = "scan_aborted"
+        cause = (f"the device died mid-scan: {death_reason}"
+                 if death_reason is not None
+                 else "the session is closing or the device disappeared "
+                      "mid-scan")
         response["note"] = (
             f"the scan stopped after {attempted} of {requested} candidate "
-            "rate(s) -- the session is closing or the device disappeared "
-            "mid-scan; ranked evidence and rejections cover only what was "
-            "actually attempted"
+            f"rate(s) -- {cause}; ranked evidence and rejections cover only "
+            "what was actually attempted"
+        )
+    elif death_reason is not None:
+        # Every candidate was attempted, so none of the count-based verdicts
+        # above fires -- but the device died somewhere in there, most often
+        # on the LAST candidate, where nothing stopped the loop early. Left
+        # to fall through, this would report a completed verdict (and, when
+        # the dying candidates came back empty, the wiring hint) for a scan
+        # whose evidence is about a link that failed partway. `alive: False`
+        # and `death_reason` were already in the response; they were just
+        # sitting next to a verdict that contradicted them.
+        response["verdict"] = "scan_device_died"
+        response["note"] = (
+            f"every candidate rate was attempted, but the link failed during "
+            f"the scan: {death_reason}. Samples taken after that point are "
+            "evidence about a dead link, not about a baud rate -- fix the "
+            "device and scan again rather than reading the ranking below as "
+            "a verdict on the rates."
         )
     elif not samples and result["rejected"]:
         # Distinct from a genuinely silent line: nothing was ever sampled
@@ -299,7 +328,15 @@ async def console_detect_baud(device: str | None = None,
             "sample could be taken; see \"rejected\" for why each one failed"
         )
     elif all_silent(samples):
+        # The BENIGN half of the wiring pair: a wrong TX/RX crossover just
+        # produces silence, and this verdict already reports that honestly.
+        # The hint is attached because the check costs an operator nothing,
+        # not because silence is the diagnostic case.
         response["verdict"] = "no_data_at_any_rate"
+        response["note"] = (
+            "no bytes arrived at any candidate rate -- the line was silent, "
+            "not garbled"
+        )
         response["hint"] = GROUND_CROSSOVER_HINT
     elif result["restored"]:
         response["verdict"] = "no_clear_winner"
@@ -307,6 +344,18 @@ async def console_detect_baud(device: str | None = None,
             "no candidate rate looked like clean console text; the session "
             f"was left at its original baud ({result['original_baud']})"
         )
+        if all_scored_poorly(samples):
+            # THE case this hint is for, and the one it used to miss. Bytes
+            # did arrive, and every candidate scored below
+            # WIRING_SUSPECT_PRINTABLE_MAX -- which is what a floating
+            # ground looks like, and also what a wrong rate looks like,
+            # because framing errors and a mis-framed rate produce the same
+            # evidence. `score_sample` cannot separate them, so the note
+            # above ("no candidate rate looked like clean console text")
+            # would otherwise send the operator off to try more rates with
+            # no indication that the wire is the other half of the
+            # explanation.
+            response["hint"] = GROUND_CROSSOVER_HINT
     else:
         response["verdict"] = "winner"
         response["note"] = (

@@ -1575,6 +1575,48 @@ def test_a_hardware_rejected_rate_is_recorded_and_the_scan_continues(manager, pt
           what="capture to resume after the restore")
 
 
+def test_a_scan_notices_the_adapter_leaving_the_bus_on_a_quiet_line(manager, pty):
+    """The quiet unplug, during a scan rather than during capture.
+
+    `_read_forever` has always made this check; the scan's own read loop did
+    not. A pty that is never written to produces empty samples at every
+    candidate, which is byte-for-byte what a floating ground produces -- and
+    tools.py hands that case a wiring hint. So without this check an adapter
+    that is simply GONE draws "check the ground wire".
+
+    The reader thread cannot be what notices: it is parked for the whole
+    scan (`_scan_pause`), touching neither the port nor `os.path.lexists`.
+    The test waits for that park before unlinking, so the only code that can
+    set `death_reason` here is the scan's own loop.
+
+    Would catch: the by-id check omitted from the scan loop (death_reason
+    stays None and every sample comes back empty), or placed where a
+    non-empty chunk would skip it.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    result: dict = {}
+
+    def scan():
+        result["value"] = session.scan_baud((9600, 115200, 230400), 0.5,
+                                            no_op_decide)
+
+    thread = threading.Thread(target=scan, daemon=True)
+    thread.start()
+    until(lambda: session._scan_parked.is_set(),
+          what="the reader thread to park for the scan")
+
+    pty.unlink_by_id()
+    thread.join(timeout=DEADLINE)
+    assert not thread.is_alive(), "the scan did not return after the unplug"
+
+    value = result["value"]
+    assert value["death_reason"] is not None, \
+        "an unplugged adapter must not read back as a silent line"
+    assert pty.by_id in value["death_reason"]
+    assert "baud scan" in value["death_reason"]
+    assert value["alive"] is False
+
+
 def test_scan_baud_restores_the_original_rate_when_there_is_no_winner(manager, pty):
     session = open_ok(manager, pty, baud=9600)
     result = session.scan_baud((9600, 115200), 0.1, no_op_decide)
