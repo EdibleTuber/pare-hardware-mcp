@@ -1902,3 +1902,357 @@ def test_close_during_a_scan_aborts_it_promptly_rather_than_hanging(manager, pty
     assert scan_returned.wait(DEADLINE)
     scanner.join(DEADLINE)
     assert manager.current is None
+
+
+# --------------------------------------------------------------------------
+# The SWEEP. The bench defect: `scan_baud` made one long pass per candidate,
+# which is correct against a line that keeps talking and wrong against the
+# target that found it -- a board that emits a burst at boot and then goes
+# silent. Whichever candidate held the window when the burst arrived was the
+# only rate to see a byte, so it won by luck.
+#
+# A pty cannot reframe bytes by baud rate, so these tests cannot show the
+# CORRECT rate winning. What they can show, and what the defect actually
+# was, is the SHAPE of the time: that a short burst reaches every candidate
+# rather than exactly one, that every candidate is sampled before an early
+# exit may be taken, and that the budget still bounds the whole thing.
+# --------------------------------------------------------------------------
+
+def burst_after(pty, delay: float, payload: bytes, stop: threading.Event):
+    """Play a board that speaks once, some time after the scan starts."""
+    def run():
+        if stop.wait(delay):
+            return
+        pty.send(payload)
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    return thread
+
+
+def test_a_short_burst_reaches_every_candidate_rate_not_just_one(manager, pty):
+    """THE defect-2 regression.
+
+    The burst is 0.35s long. One full sweep of three candidates at 0.1s
+    dwell is 0.3s, so a sweeping scan puts part of the burst in every rate's
+    window. The single-pass scan this replaced spent 0.5s per candidate over
+    the same 1.5s budget, so a 0.35s burst fell entirely inside ONE
+    candidate's window and every other rate reported silence.
+
+    Would catch: the sweep collapsed back to one pass (verified -- with the
+    loop reverted to a single pass at the same total budget, exactly one
+    rate receives bytes and `sweeps` is 1).
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    payload = b"U-Boot 2017.09\r\nDRAM:  4 GiB\r\n" * 12
+    try:
+        # Emit continuously for ~0.35s starting shortly after the scan does.
+        def run():
+            if stop.wait(0.15):
+                return
+            end = time.monotonic() + 0.35
+            while time.monotonic() < end and not stop.is_set():
+                pty.send(payload)
+                time.sleep(0.02)
+        writer = threading.Thread(target=run, daemon=True)
+        writer.start()
+        result = session.scan_baud((9600, 115200, 230400), 0.1, no_op_decide,
+                                   budget_seconds=1.5)
+    finally:
+        stop.set()
+    writer.join(timeout=DEADLINE)
+
+    assert result["sweeps"] >= 3, (
+        f"a 1.5s budget at 0.1s x 3 rates must sweep several times, not "
+        f"{result['sweeps']}")
+    heard = {rate for rate, data in result["samples"].items() if data}
+    assert heard == {9600, 115200, 230400}, (
+        "a burst shorter than a single-pass dwell must still reach every "
+        f"candidate; only {heard} heard anything")
+
+
+def test_the_scan_stays_inside_its_budget_while_sweeping(manager, pty):
+    """Sweeping changes the shape of the time spent, not the amount.
+
+    Would catch a sweep loop with no deadline check, which runs forever
+    against a talking line, and -- the mutation that survived the first
+    version of this test -- one that checks the deadline only BETWEEN
+    sweeps, which overruns by a whole sweep.
+
+    The bound is stated as a relationship rather than a number, because the
+    number is the thing being tested: the deadline is checked before each
+    CANDIDATE, so the overrun is at most the dwell in flight, and that is
+    strictly less than half a sweep for any list of more than two rates. A
+    between-sweeps check overruns by a full sweep and fails it. The rates are
+    chosen so one sweep is comparable to the whole budget, which is what
+    makes the two cases far apart in wall time (~1.35s against ~2.0s) rather
+    than a few milliseconds apart.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    pump = threading.Thread(
+        target=lambda: [pty.send(b"chatter chatter\r\n") or time.sleep(0.005)
+                        for _ in iter(lambda: not stop.is_set(), False)],
+        daemon=True)
+    pump.start()
+    rates = (9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600,
+             1152000, 1500000)
+    dwell, budget = 0.1, 1.2
+    try:
+        started = time.monotonic()
+        result = session.scan_baud(rates, dwell, no_op_decide,
+                                   budget_seconds=budget)
+        elapsed = time.monotonic() - started
+    finally:
+        stop.set()
+    pump.join(timeout=DEADLINE)
+
+    one_sweep = len(rates) * dwell
+    assert result["sweeps"] >= 1
+    assert elapsed < budget + one_sweep / 2, (
+        f"overran the {budget}s budget by more than half a sweep: {elapsed}s")
+    assert result["budget_seconds"] == budget
+
+
+def test_every_candidate_is_sampled_before_an_early_exit_may_be_taken(manager, pty):
+    """An early exit must not make the result dishonest about rates it never
+    reached.
+
+    `early_exit` here accepts the very first thing it is offered, which is
+    the most aggressive exit possible. Every candidate must still appear in
+    `samples` with its own `listen_seconds`, because the exit is only
+    offered at the END of a completed sweep.
+
+    Would catch the early-exit check moved inside the candidate loop, which
+    is the obvious place to put it and which drops every later rate from the
+    ranking without saying so.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    pump = threading.Thread(
+        target=lambda: [pty.send(b"talking\r\n") or time.sleep(0.005)
+                        for _ in iter(lambda: not stop.is_set(), False)],
+        daemon=True)
+    pump.start()
+    try:
+        rates = (9600, 115200, 230400, 460800)
+        result = session.scan_baud(rates, 0.1, no_op_decide,
+                                   budget_seconds=5.0,
+                                   early_exit=lambda data: True)
+    finally:
+        stop.set()
+    pump.join(timeout=DEADLINE)
+
+    assert result["early_exit"] is True
+    assert result["sweeps"] == 1, "the exit is taken at the end of sweep 1"
+    assert set(result["samples"]) == set(rates), (
+        "an early exit left candidates unsampled: "
+        f"{set(rates) - set(result['samples'])}")
+    for rate in rates:
+        assert result["listen_seconds"][rate] > 0.0, rate
+
+
+def test_an_early_exit_that_never_fires_spends_the_whole_budget(manager, pty):
+    """The companion: `early_exit` returning False must not end the scan.
+
+    Would catch the predicate's sense inverted, and an exit taken on a
+    falsy return.
+
+    The line has to be talking for this to mean anything: an EMPTY sample is
+    never offered to the predicate -- silence cannot look like console output
+    at any rate, and scoring it would only give a buggy predicate a chance to
+    end the scan on no evidence at all.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop = threading.Event()
+    pump = threading.Thread(
+        target=lambda: [pty.send(b"talking\r\n") or time.sleep(0.005)
+                        for _ in iter(lambda: not stop.is_set(), False)],
+        daemon=True)
+    pump.start()
+    calls = []
+    try:
+        result = session.scan_baud((9600, 115200), 0.1, no_op_decide,
+                                   budget_seconds=0.8,
+                                   early_exit=lambda data: calls.append(1) and False)
+    finally:
+        stop.set()
+    pump.join(timeout=DEADLINE)
+    assert result["early_exit"] is False
+    assert result["sweeps"] >= 3
+    assert calls, "the predicate was never consulted"
+
+
+def test_a_default_budget_is_exactly_one_sweep(manager, pty):
+    """The single-pass shape survives as the degenerate case of the sweep,
+    so the coordination tests above it exercise the same code path rather
+    than a second one that could drift.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud((9600, 115200, 230400), 0.1, no_op_decide)
+    assert result["budget_seconds"] == pytest.approx(0.3)
+    assert result["sweeps"] == 1
+    assert set(result["samples"]) == {9600, 115200, 230400}
+
+
+def test_a_rate_the_hardware_refuses_is_not_retried_on_every_sweep(manager, pty):
+    """A refused rate is refused for the whole scan, not once per pass.
+
+    Sweeping turns one wasted termios call into one per sweep, and -- worse
+    -- `rejected[rate]` would be rewritten each time, so a transient refusal
+    on a later sweep could overwrite the first and truthful reason. Would
+    catch the rejected rate left in the sweep's working list.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    attempts = []
+    real = type(session._serial).baudrate
+
+    class Spy:
+        def __get__(self, obj, owner=None):
+            return real.__get__(obj, owner)
+
+        def __set__(self, obj, value):
+            attempts.append(value)
+            if value == 333333:
+                raise ValueError("kernel refused it")
+            real.__set__(obj, value)
+
+    monkey = type(session._serial)
+    original = monkey.baudrate
+    monkey.baudrate = Spy()
+    try:
+        result = session.scan_baud((9600, 333333, 115200), 0.1, no_op_decide,
+                                   budget_seconds=1.0)
+    finally:
+        monkey.baudrate = original
+
+    assert result["sweeps"] >= 3
+    assert result["rejected"] == {333333: "kernel refused it"}
+    assert attempts.count(333333) == 1, (
+        f"the refused rate was re-applied {attempts.count(333333)} times "
+        f"across {result['sweeps']} sweeps")
+    assert 333333 not in result["samples"]
+
+
+def test_a_sweep_still_records_exactly_one_capture_gap(manager, pty):
+    """The reader parks ONCE for the whole sweep, not once per dwell.
+
+    This is the part of the change that had to not move: `_scan_pause` /
+    `_scan_parked` and the gap ledger are unchanged, and a sweep of many
+    dwells must still read as one suspension. Would catch a sweep that
+    parked and unparked the reader per pass, which would also mean the
+    reader appending bytes into the capture at a candidate rate.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    pty.send(b"before the scan\r\n")
+    until(lambda: session.buffer.head > 0, what="pre-scan capture")
+
+    before = session.gap_summary()["count"]
+    result = session.scan_baud((9600, 115200, 230400), 0.1, no_op_decide,
+                               budget_seconds=1.0)
+    after = session.gap_summary()
+
+    assert result["sweeps"] >= 2
+    assert after["count"] == before + 1, "one scan, one gap, however many sweeps"
+    assert after["capture_suspended"] is False
+    assert result["gap"]["duration_s"] >= 1.0
+
+
+def test_a_multi_sweep_scan_keeps_the_reader_parked_the_whole_time(manager, pty):
+    """The single highest-risk thing the sweep could have broken.
+
+    `test_scan_baud_samples_never_reach_the_capture_buffer` proves the same
+    property, but it runs a ONE-SWEEP scan -- so a sweep that releases and
+    re-takes the park between passes has no "between" for it to be caught
+    in, and it passes against that mutation. Verified: with the sweep
+    mutated to clear `_scan_pause` and re-park each pass, the whole suite
+    passed and only this test fails.
+
+    It matters because an unparked reader does not merely race for bytes: it
+    appends them to the CAPTURE, at whatever candidate rate the scan has
+    applied at that instant, as if the target had said them at the session's
+    real rate. The park is what makes repeated sweeping safe at all.
+
+    Method is the existing test's, for the same reason: send continuously
+    and poll continuously, so a mutant reader has the whole scan to be
+    caught growing `head` rather than one racy instant.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    stop_sender = threading.Event()
+
+    def sender():
+        while not stop_sender.is_set():
+            try:
+                pty.send(b"y" * 64)
+            except OSError:
+                return
+            time.sleep(0.005)
+
+    sender_thread = threading.Thread(target=sender, daemon=True)
+    sender_thread.start()
+
+    scan_result: dict = {}
+    scan_done = threading.Event()
+
+    def run_scan():
+        try:
+            scan_result["value"] = session.scan_baud(
+                (9600, 115200, 230400), 0.1, no_op_decide, budget_seconds=1.2)
+        finally:
+            scan_done.set()
+
+    scanner = threading.Thread(target=run_scan, daemon=True)
+    scanner.start()
+    until(lambda: session._scan_parked.is_set(), what="the reader to park")
+    head_at_park = session.buffer.head
+
+    observed_heads = []
+    unparked = []
+    while not scan_done.is_set():
+        observed_heads.append(session.buffer.head)
+        if not session._scan_pause.is_set():
+            unparked.append(time.monotonic())
+        time.sleep(0.005)
+
+    stop_sender.set()
+    sender_thread.join(DEADLINE)
+    scanner.join(DEADLINE)
+
+    assert observed_heads, "the poll loop never ran; this test proves nothing"
+    assert scan_result["value"]["sweeps"] >= 3, (
+        "a one-sweep scan cannot exercise the between-sweeps window this "
+        f"test exists for (swept {scan_result['value'].get('sweeps')})")
+    assert unparked == [], (
+        f"the scan released the reader park {len(unparked)} time(s) mid-scan")
+    assert max(observed_heads) == head_at_park, (
+        f"buffer.head grew from {head_at_park} to {max(observed_heads)} while "
+        "the scan believed it was the only thing reading the port")
+    assert sum(len(v) for v in scan_result["value"]["samples"].values()) > 0, (
+        "the sender never reached the scan's own samples either -- this "
+        "test would prove nothing")
+
+
+def test_the_first_sweep_completes_even_when_the_budget_is_already_spent(manager, pty):
+    """The honesty guarantee, at its boundary.
+
+    `check_budget` refuses a candidate list too long to sweep once, but
+    `scan_baud` takes `budget_seconds` from its caller and must not rely on
+    that check having been made: every candidate gets sampled at least once
+    or the ranking is silent about rates nobody ever tried. A budget smaller
+    than a single dwell is the sharpest form of the question.
+
+    Would catch the first-sweep exemption dropped from the deadline check --
+    which is a one-token change (`if sweeps >= 1 and ...` to `if ...`) and
+    leaves a scan reporting one candidate out of four with no indication the
+    others were skipped.
+    """
+    rates = (9600, 115200, 230400, 460800)
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud(rates, 0.05, no_op_decide, budget_seconds=0.001)
+
+    assert result["sweeps"] == 1
+    assert set(result["samples"]) == set(rates), (
+        "candidates were skipped by an already-spent budget: "
+        f"{set(rates) - set(result['samples'])}")
+    for rate in rates:
+        assert result["listen_seconds"][rate] > 0.0, rate

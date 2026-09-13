@@ -29,9 +29,12 @@ class Config:
     # the check -- the point is that an OPERATOR declares it out of band.
     expect_serial: str | None = None
     # PARE_HW_REQUEST_DEADLINE_S: the deadline `console_detect_baud` checks its
-    # scan budget (len(rates) * sample_seconds) against before touching the
-    # port, refusing a candidate list that would run past it rather than
-    # discovering the overrun as a transport-level timeout. This worker is
+    # scan budget (baud.DEFAULT_SCAN_BUDGET_SECONDS -- a fixed wall-clock
+    # budget the sweep spends, NOT a per-candidate cost that grows with the
+    # rate list) against before touching the port, refusing a scan that would
+    # run past it rather than discovering the overrun as a transport-level
+    # timeout. A candidate list too long to sweep even once is refused by the
+    # same check, against the budget rather than against this. This worker is
     # still declared `transport: stdio` in workers.yaml (see the module
     # docstring), so there is no real `read_timeout` to read yet -- 60
     # matches the `read_timeout` already used by another networked worker's

@@ -17,9 +17,9 @@ import json
 import pytest
 
 from pare_hardware_mcp import tools
-from pare_hardware_mcp.baud import (WINNER_PRINTABLE_THRESHOLD,
-                                    WIRING_SUSPECT_PRINTABLE_MAX,
-                                    score_sample)
+from pare_hardware_mcp.baud import (WINNER_CONSOLE_THRESHOLD,
+                                    WIRING_SUSPECT_CONSOLE_MAX,
+                                    looks_like_console, score_sample)
 
 
 class FakeSession:
@@ -33,8 +33,10 @@ class FakeSession:
         self._scan_exc = scan_exc
         self.scan_calls = []
 
-    def scan_baud(self, rates, sample_seconds, decide):
-        self.scan_calls.append((rates, sample_seconds))
+    def scan_baud(self, rates, dwell_seconds, decide, budget_seconds=None,
+                  early_exit=None):
+        self.scan_calls.append((rates, dwell_seconds, budget_seconds,
+                                early_exit))
         if self._scan_exc is not None:
             raise self._scan_exc
         return self._scan_result
@@ -55,6 +57,13 @@ def install(monkeypatch, session=None, deadline=60.0):
 
 GAP = {"at_cursor": 42, "duration_s": 12.0, "reason": "baud scan", "in_progress": False}
 
+# The sweep-shaped half of `scan_baud`'s result. `listen_seconds` is left
+# empty on purpose in most fixtures: `rank_candidates` must report 0.0 for a
+# rate the scan did not account for rather than raising, since a scan aborted
+# mid-sweep really can return a rate with no timing recorded against it.
+SWEEP = {"listen_seconds": {}, "sweeps": 3, "early_exit": False,
+         "budget_seconds": 12.0}
+
 
 def winner_result(original=9600, final=115200):
     return {
@@ -66,6 +75,7 @@ def winner_result(original=9600, final=115200):
         "alive": True,
         "death_reason": None,
         "gap": GAP,
+        **SWEEP,
     }
 
 
@@ -125,7 +135,7 @@ async def test_zero_is_filtered_rather_than_reaching_the_session(monkeypatch):
     session = FakeSession(scan_result=winner_result())
     install(monkeypatch, session=session)
     await tools.console_detect_baud(rates=[0, 9600, 115200])
-    (rates, _sample_seconds), = session.scan_calls
+    (rates, _dwell, _budget, _early_exit), = session.scan_calls
     assert 0 not in rates
 
 
@@ -195,6 +205,7 @@ async def test_every_candidate_scoring_poorly_names_ground_and_crossover(monkeyp
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -213,21 +224,23 @@ async def test_a_marginal_no_clear_winner_does_not_accuse_the_wiring(monkeypatch
     """The other side of the threshold, and the reason it is not 0.85.
 
     These samples are mostly-printable text that simply did not clear
-    `WINNER_PRINTABLE_THRESHOLD` -- a rate near the right one, worth
+    `WINNER_CONSOLE_THRESHOLD` -- a rate near the right one, worth
     retrying. Would catch: the hint attached to every `restored` verdict, or
-    a `WIRING_SUSPECT_PRINTABLE_MAX` raised to the winner threshold, which
+    a `WIRING_SUSPECT_CONSOLE_MAX` raised to the winner threshold, which
     would fire on every ordinary missed-rate scan and train a caller to
     ignore it.
     """
     marginal = b"U-Boot 2021.01 \r\n" * 6 + bytes(range(128, 160))
-    ratio = score_sample(marginal)["printable_ratio"]
-    assert WIRING_SUSPECT_PRINTABLE_MAX < ratio < WINNER_PRINTABLE_THRESHOLD, ratio
+    scored = score_sample(marginal)
+    assert WIRING_SUSPECT_CONSOLE_MAX < scored["console_score"], scored
+    assert not looks_like_console(scored), scored
 
     result = {
         "samples": {9600: marginal, 115200: marginal},
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -249,14 +262,14 @@ async def test_one_readable_candidate_among_noise_does_not_accuse_the_wiring(mon
     path -- which is why this fixture is deliberately `restored: True`.)
     """
     marginal = b"U-Boot 2021.01 \r\n" * 6 + bytes(range(128, 160))
-    assert (WIRING_SUSPECT_PRINTABLE_MAX
-            < score_sample(marginal)["printable_ratio"]
-            < WINNER_PRINTABLE_THRESHOLD)
+    assert WIRING_SUSPECT_CONSOLE_MAX < score_sample(marginal)["console_score"]
+    assert not looks_like_console(score_sample(marginal))
     result = {
         "samples": {9600: bytes(range(128, 256)), 115200: marginal},
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -284,6 +297,7 @@ async def test_a_device_that_died_on_the_last_candidate_is_not_a_clean_verdict(m
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": False, "death_reason": gone, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -314,6 +328,7 @@ async def test_a_close_racing_the_response_does_not_read_as_a_device_death(monke
         "rejected": {},
         "original_baud": 9600, "final_baud": 115200, "restored": False,
         "alive": False, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -336,6 +351,7 @@ async def test_a_device_that_died_after_silent_candidates_is_not_a_wiring_verdic
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": False, "death_reason": gone, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -355,6 +371,7 @@ async def test_an_aborted_scan_names_the_death_when_there_was_one(monkeypatch):
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": False, "death_reason": gone, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -371,6 +388,7 @@ async def test_a_totally_silent_line_names_ground_and_crossover(monkeypatch):
         "rejected": {},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -392,6 +410,7 @@ async def test_all_candidates_rejected_is_distinguished_from_a_silent_line(monke
         "rejected": {250000: "kernel rejected it", 999999: "kernel rejected it"},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -417,6 +436,7 @@ async def test_a_partial_rejection_still_reports_ranked_evidence(monkeypatch):
         "rejected": {250000: "kernel rejected it"},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -445,6 +465,7 @@ async def test_a_scan_aborted_partway_gets_its_own_verdict(monkeypatch):
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True,  # racy and still True at this instant -- must not be relied on
         "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -463,6 +484,7 @@ async def test_a_fully_completed_all_rejected_scan_is_not_misreported_as_aborted
         "rejected": {9600: "x", 115200: "x"},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
         "alive": True, "death_reason": None, "gap": GAP,
+        **SWEEP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)

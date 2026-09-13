@@ -44,7 +44,9 @@ import os
 import re
 from typing import Any
 
-from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_SAMPLE_SECONDS,
+from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_DWELL_SECONDS,
+                                    DEFAULT_SCAN_BUDGET_SECONDS,
+                                    looks_like_console_bytes,
                                     GROUND_CROSSOVER_HINT, all_scored_poorly,
                                     all_silent, check_budget, pick_winner,
                                     rank_candidates, sanitize_rates)
@@ -365,8 +367,8 @@ async def console_detect_baud(device: str | None = None,
 
     try:
         candidate_rates = sanitize_rates(rates)
-        check_budget(len(candidate_rates), DEFAULT_SAMPLE_SECONDS,
-                     CONFIG.request_deadline_s)
+        check_budget(len(candidate_rates), DEFAULT_DWELL_SECONDS,
+                     DEFAULT_SCAN_BUDGET_SECONDS, CONFIG.request_deadline_s)
     except BaudScanError as exc:
         return _err(str(exc))
 
@@ -375,12 +377,13 @@ async def console_detect_baud(device: str | None = None,
         # loop so a concurrent low-tier call (status, a read) is not starved
         # for the whole scan.
         result = await asyncio.to_thread(
-            sess.scan_baud, candidate_rates, DEFAULT_SAMPLE_SECONDS, pick_winner)
+            sess.scan_baud, candidate_rates, DEFAULT_DWELL_SECONDS, pick_winner,
+            DEFAULT_SCAN_BUDGET_SECONDS, looks_like_console_bytes)
     except SessionError as exc:
         return _err(str(exc))
 
     samples = result["samples"]
-    candidates = rank_candidates(samples)
+    candidates = rank_candidates(samples, result["listen_seconds"])
     for candidate in candidates:
         candidate["sample_b64"] = base64.b64encode(candidate.pop("sample")).decode("ascii")
 
@@ -392,6 +395,14 @@ async def console_detect_baud(device: str | None = None,
         alive=result["alive"],
         death_reason=result["death_reason"],
         candidates=candidates,
+        # How the budget was actually spent. `sweeps` is the number of
+        # COMPLETE passes over the candidate list, and `early_exit` says
+        # whether the scan stopped on a clear winner rather than on the
+        # clock. Both are here because a caller comparing two candidates'
+        # evidence needs to know it is not always the same amount of
+        # evidence -- `listen_seconds` on each candidate says how much.
+        sweeps=result["sweeps"],
+        early_exit=result["early_exit"],
         # A candidate the hardware itself rejected at apply time (not a
         # sanitize_rates/scan_baud ceiling refusal, which never reaches
         # here) -- named per rate, alongside whatever candidates DID get
@@ -491,14 +502,16 @@ async def console_detect_baud(device: str | None = None,
         if all_scored_poorly(samples):
             # THE case this hint is for, and the one it used to miss. Bytes
             # did arrive, and every candidate scored below
-            # WIRING_SUSPECT_PRINTABLE_MAX -- which is what a floating
-            # ground looks like, and also what a wrong rate looks like,
-            # because framing errors and a mis-framed rate produce the same
-            # evidence. `score_sample` cannot separate them, so the note
-            # above ("no candidate rate looked like clean console text")
-            # would otherwise send the operator off to try more rates with
-            # no indication that the wire is the other half of the
-            # explanation.
+            # WIRING_SUSPECT_CONSOLE_MAX -- which is what a floating ground
+            # looks like, what a wrong rate looks like, and what a target
+            # whose rate is not on the list looks like, because all three
+            # produce mis-framed bytes and `score_sample` cannot separate
+            # them. The note above ("no candidate rate looked like clean
+            # console text") would otherwise send the operator off to try
+            # more rates with no indication that the wire is one of the
+            # other explanations -- or, as the bench proved, that a
+            # perfectly correct rig can land here because the ladder did
+            # not reach the target's rate. The hint names all three.
             response["hint"] = GROUND_CROSSOVER_HINT
     else:
         response["verdict"] = "winner"
