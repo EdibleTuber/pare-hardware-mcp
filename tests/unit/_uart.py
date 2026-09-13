@@ -29,6 +29,35 @@ WHAT THIS IS NOT: a model of a floating ground, of TX/RX swapped, or of
 framing-error counts. It models one fault -- the receiver's clock is wrong --
 because that is the one the bench measured. Do not read a passing test here
 as evidence about the other two.
+
+KNOWN FIDELITY GAPS. Both make this model MORE PERMISSIVE than real hardware
+-- they let the simulated receiver deliver bytes a real one would not, so a
+margin measured against this fixture is a lower bound on the margin against
+a real UART. That is the safe direction for the claims the suite makes with
+it, which is why they are recorded rather than fixed; anyone tightening them
+should expect the measured margins to WIDEN, not narrow.
+
+1. NO RESYNCHRONISATION ON IDLE AFTER A FRAMING ERROR. In `receive`, the
+   post-byte `t = start + rx_bit * 9.5; prev = 1` is unconditional: the
+   receiver declares itself back at mark and starts hunting for the next
+   falling edge even when the line is still LOW, and even when the stop bit
+   it just sampled was low (a framing error). A real UART waits for the line
+   to return to mark before it will accept another start bit. So this
+   receiver manufactures extra framed bytes out of a long low run where real
+   hardware would sit in a framing-error state and emit fewer. More bytes,
+   more chances for one of them to look like text.
+
+2. THE INTER-BYTE GAP IS UNIFORM. `to_waveform` inserts exactly
+   `idle_bits_between` idle bits between EVERY pair of bytes, so the
+   transmitter is perfectly periodic. A real FIFO-driven transmitter is not:
+   it sends bursts at full rate and then stalls unpredictably when the CPU
+   cannot refill. Uniform spacing makes the aliasing between the two clocks
+   more regular than it is on a bench, which is exactly the condition under
+   which a wrong rate produces the most self-consistent, most text-like
+   output. Sweeping `idle_bits_between` across several values (see `GAPS` in
+   `test_baud.py`) samples that regularity at several phases rather than
+   pretending one of them is the truth, but every one of them is still more
+   regular than real traffic.
 """
 from __future__ import annotations
 
@@ -111,6 +140,10 @@ def to_waveform(data: bytes, idle_bits_between: int = 0,
     lines. It is a free parameter because the real one is unknowable, and
     because sweeping it is exactly how this module shows `printable_ratio`
     to be unstable.
+
+    It is applied UNIFORMLY between every pair of bytes, which a real
+    FIFO-driven transmitter does not do -- see fidelity gap 2 in the module
+    docstring.
     """
     bits = [1] * lead_idle
     for byte in data:
@@ -133,6 +166,10 @@ def receive(bits: list[int], tx_baud: float, rx_baud: float) -> tuple[bytes, int
     either way -- ftdi_sio passes a framing-errored byte through to the
     application, which is precisely why a wrong rate yields plausible
     garbage rather than an error.
+
+    Does NOT wait for the line to return to mark after a framing error --
+    see fidelity gap 1 in the module docstring. The jump to
+    `start + rx_bit * 9.5` and the reset of `prev` below are unconditional.
 
     Returns `(bytes, framing_errors)`. The framing count is returned for
     documentation only: `baud.score_sample` does NOT measure framing errors

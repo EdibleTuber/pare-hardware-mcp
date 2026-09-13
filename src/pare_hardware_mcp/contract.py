@@ -56,11 +56,16 @@ TOOL_SPECS: list[ToolSpec] = [
              "root present and writable, drive id. Cheap, no session needed.",
              dict(_OBJ)),
     ToolSpec("console_detect_baud", "low",
-             "Sample the line at each candidate rate and return them RANKED "
-             "WITH SCORES, not a verdict: a wrong rate yields plausible "
-             "garbage rather than an error, so the caller must see the "
-             "evidence. Needs the target to be transmitting; a silent line "
-             "reports no-data-at-any-rate rather than guessing.",
+             "Detect the rate of a CHATTERING line -- one that is producing "
+             "output throughout the scan window. Samples at each candidate "
+             "rate and returns them RANKED WITH SCORES, not a verdict: a "
+             "wrong rate yields plausible garbage rather than an error, so "
+             "the caller must see the evidence. IT WILL NOT RELIABLY CATCH A "
+             "BOOT BURST: a board's boot output can be milliseconds of wire "
+             "time at a high rate, and a scan that samples one rate at a time "
+             "is usually listening elsewhere when it lands. If you already "
+             "know the rate, pass it to console_open rather than scanning. A "
+             "silent line reports no-data-at-any-rate rather than guessing.",
              _in(device={"type": "string"},
                  rates={"type": "array", "items": {"type": "integer"}})),
     ToolSpec("console_open", "medium",

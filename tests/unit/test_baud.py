@@ -1,6 +1,7 @@
 # tests/unit/test_baud.py
 from __future__ import annotations
 
+import collections
 import random
 
 import pytest
@@ -12,6 +13,7 @@ from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_DWELL_SECONDS,
                                     GROUND_CROSSOVER_HINT, MAX_BAUD_RATE,
                                     WINNER_CONSOLE_THRESHOLD,
                                     WINNER_PRINTABLE_THRESHOLD,
+                                    SPACE_RATIO_REFERENCE,
                                     WIRING_SUSPECT_CONSOLE_MAX,
                                     all_scored_poorly, all_silent,
                                     check_budget, looks_like_console,
@@ -19,15 +21,105 @@ from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_DWELL_SECONDS,
                                     sanitize_rates, score_sample)
 from pare_hardware_mcp.config import Config
 
-# Every wrong rate in the default ladder, across a spread of transmitter
-# inter-byte timings. Built once: it is ~0.5s of simulation.
+def _bit_runs(byte: int) -> int:
+    """How many unbroken runs of like bits the byte is, in TIME order.
+
+    UART sends LSB first, so that is the order the receiver samples in. A
+    byte that is one or two runs is a solid block -- what resampling a
+    waveform at the wrong clock produces. 0x20 is three runs: a lone 1
+    between two blocks of 0s.
+    """
+    seq = [(byte >> k) & 1 for k in range(8)]
+    return 1 + sum(1 for i in range(7) if seq[i] != seq[i + 1])
+
+
+GAPS = (0, 1, 2, 3, 5, 8)
+"""Transmitter inter-byte idle times swept, in bit periods. See `_uart.py`:
+the gap is a free parameter because the real one is unknowable, and sweeping
+it is what shows `printable_ratio` to be unstable."""
+
 MISFRAMED = [
-    (gap, rate, _uart.misframed(rate, gap))
-    for gap in (0, 1, 2, 3, 5, 8)
-    for rate in DEFAULT_RATES
-    if rate != _uart.ROCKCHIP_CONSOLE_BAUD
+    (gap, tx, rx, _uart.misframed(rx, gap, tx_baud=tx))
+    for gap in GAPS
+    for tx in DEFAULT_RATES
+    for rx in DEFAULT_RATES
+    if rx < tx
 ]
-MISFRAMED = [(gap, rate, data) for gap, rate, data in MISFRAMED if data]
+MISFRAMED = [t for t in MISFRAMED if t[3]]
+"""Every ordered rate pair in the default ladder where the RECEIVER IS THE
+SLOWER of the two, across `GAPS` transmitter timings.
+
+This used to be sourced from a single transmit rate (1 500 000, the bench's
+target), which meant the suite never saw a near-neighbour ratio -- the
+2:1 and 5:4 cases where a wrong rate resembles the right one most closely,
+and where the worst-scoring garbage in fact lives. Parameterising over
+`tx_baud` is what brings those under test.
+
+WHY ONLY `rx < tx`. The two halves were timed separately by driving
+`_uart.misframed` over each one directly; the cost of simulating a pair is
+proportional to `rx / tx`, because the receiver's step size shrinks with its
+own bit period while the waveform's length is set by the transmitter's:
+
+- `rx < tx`, the half kept here: 330 samples, ~1.6 s to build, and the worst
+  `console_score` in it is 0.100 -- a fifth of `WINNER_CONSOLE_THRESHOLD`,
+  and it occurs at tx=3 000 000 / rx=57 600, a pair the old single-tx fixture
+  could not produce.
+- `rx > tx`, the half left out: another 330 samples costing **410 s** to
+  build -- 265x the runtime of the half that is kept -- for a population
+  whose worst `console_score` is **0.0020**. That number does not move when
+  the payload is shortened or the inter-byte gap is changed (measured at a
+  0.2 s and a 0.05 s dwell-realistic payload: still 0.0020, and still 27 s
+  at the cheaper one). A receiver clocked faster than the transmitter
+  oversamples every bit, so it yields long runs of 0x00 and 0xff, which the
+  scorer already rejects by a factor of 250. It is the easy half, and it is
+  the expensive half.
+
+`OVERSAMPLED` below keeps the fast-receiver direction present in the suite
+at the one place it is cheap, so the asymmetry is documented rather than
+silently absent. To re-measure either half, change the `rx < tx` predicate
+above and time the collection; nothing else in this file depends on it.
+"""
+
+OVERSAMPLED = [
+    (gap, _uart.ROCKCHIP_CONSOLE_BAUD, 3000000,
+     _uart.misframed(3000000, gap, tx_baud=_uart.ROCKCHIP_CONSOLE_BAUD))
+    for gap in GAPS
+]
+"""The fast-receiver direction, at the only tx rate where it is cheap.
+
+The bench's own target (1 500 000) heard at the top of the ladder. ~0.3 s to
+build, against 410 s for the whole `rx > tx` half -- see `MISFRAMED`. Kept so
+that "a receiver clocked faster than the transmitter" is a case the suite
+actually evaluates rather than one a docstring asserts about.
+"""
+
+GENUINE = {
+    "boot log": _uart.BOOT_LOG,
+    "LF-only console": _uart.BOOT_LOG.replace(b"\r\n", b"\n"),
+    "256-byte slice": _uart.BOOT_LOG[:256],
+    "U-Boot banner": b"U-Boot 2021.01\r\nHit any key to stop autoboot\r\n" * 4,
+    "hexdump": b"\r\n".join(
+        b"%08x  %s |................|"
+        % (i * 16, b" ".join(b"%02x" % ((i * 7 + j) & 0xFF) for j in range(16)))
+        for i in range(60)),
+    "timestamp-only kernel log": b"\r\n".join(
+        b"[%10.6f] %d %d %d" % (i / 1000, i, i * 3, i * 7) for i in range(120)),
+}
+"""The varieties of GENUINE console output the scorer must not reject.
+
+Collected here because `baud.py`'s docstrings used to quote a COUNT of them
+("ten varieties") and a floor on their scores, and both had drifted away from
+what the suite actually contained -- there were never ten, and nothing
+asserted either figure, so nothing caught the drift. The docstrings now point
+at this dict and at the tests below, which assert the RELATIONSHIPS the
+figures were standing in for. Add a variety here and the bars are re-checked
+against it automatically.
+
+Deliberately spans the awkward cases: output with no words in it at all (the
+hexdump and the timestamp-only log have zero runs of three letters), an
+LF-only console, and a sample short enough that `line_structure`'s
+small-sample behaviour is in play.
+"""
 
 
 def test_readable_text_scores_far_above_high_bit_noise():
@@ -330,7 +422,7 @@ def test_the_simulator_reproduces_the_benchs_printable_ratio():
     rather than "the simulator produces 0.75", because the RANGE is the
     finding: the ratio is not stable across transmit timings.
     """
-    ratios = [score_sample(d)["printable_ratio"] for _, _, d in MISFRAMED]
+    ratios = [score_sample(d)["printable_ratio"] for *_, d in MISFRAMED]
     assert min(ratios) < 0.75 < max(ratios), (min(ratios), max(ratios))
 
 
@@ -351,7 +443,7 @@ def test_printable_ratio_alone_cannot_separate_garbage_from_console_text():
     future change that quietly reverts to printable-only scoring has
     something to fail against.
     """
-    ratios = [score_sample(d)["printable_ratio"] for _, _, d in MISFRAMED]
+    ratios = [score_sample(d)["printable_ratio"] for *_, d in MISFRAMED]
     assert max(ratios) > 0.5, (
         "if no simulated misframing scores above 0.5 the premise of this "
         "whole section is wrong")
@@ -368,10 +460,178 @@ def test_every_misframed_sample_scores_far_below_genuine_console_output():
     one factor.
     """
     genuine = score_sample(_uart.BOOT_LOG)["console_score"]
-    worst = max(score_sample(d)["console_score"] for _, _, d in MISFRAMED)
+    worst = max(score_sample(d)["console_score"] for *_, d in MISFRAMED)
     assert genuine > 0.74, genuine
     assert worst < WIRING_SUSPECT_CONSOLE_MAX, worst
     assert genuine > 5 * worst, (genuine, worst)
+
+
+def test_every_genuine_variety_clears_the_winner_bar_with_margin():
+    """The floor `baud.py` used to quote as a literal ("ten varieties ...
+    >= 0.744"), asserted as a RELATIONSHIP instead.
+
+    There were never ten varieties and nothing asserted the floor, so the
+    figure drifted unnoticed. What the figure was standing in for is that
+    every kind of genuine console output clears `WINNER_CONSOLE_THRESHOLD`
+    with room to spare -- which is checked here against `GENUINE`, so adding
+    a variety re-checks it and no number has to be maintained by hand.
+    """
+    for name, sample in GENUINE.items():
+        scored = score_sample(sample)
+        assert looks_like_console(scored), (name, scored)
+        assert scored["console_score"] > 1.4 * WINNER_CONSOLE_THRESHOLD, (
+            name, scored["console_score"])
+
+
+def test_every_misframed_sample_scores_a_fraction_of_the_winner_bar():
+    """The other half of the separation, likewise as a relationship.
+
+    `baud.py` used to quote "<= 0.074" for a fixture of 60 samples that its
+    prose called 74. The property is that the WHOLE misframed population sits
+    far under the bar -- now over every ordered rate pair with a slower
+    receiver, including the near-neighbour ratios the old single-tx fixture
+    could not reach.
+    """
+    worst = max(score_sample(d)["console_score"] for *_, d in MISFRAMED)
+    assert worst < WINNER_CONSOLE_THRESHOLD / 3, worst
+    best_genuine_floor = min(
+        score_sample(v)["console_score"] for v in GENUINE.values())
+    assert best_genuine_floor > 5 * worst, (best_genuine_floor, worst)
+
+
+def test_misframed_bytes_are_concentrated_rather_than_uniform():
+    """The MECHANISM correction: they do not spread out evenly at all.
+
+    `SPACE_RATIO_REFERENCE` used to argue that resampling "spreads the result
+    across the reachable byte values roughly evenly, so no value -- 0x20
+    included -- gets more than a few percent". That is false, and this test
+    is what makes it stay false-and-known: the distribution is heavily
+    concentrated, and the real reason 0x20 stays rare is the SHAPE of the
+    values it concentrates on (see the next test), not their spread.
+
+    A maintainer deciding whether `space_factor` is redundant has to reason
+    from the true mechanism; reasoning from "roughly uniform" gets the wrong
+    answer.
+    """
+    shares, distinct = [], []
+    for *_, data in MISFRAMED:
+        counts = collections.Counter(data)
+        shares.append(counts.most_common(1)[0][1] / len(data))
+        distinct.append(len(counts))
+    assert max(shares) > 0.5, max(shares)
+    assert min(distinct) < 16, min(distinct)
+
+
+def test_misframing_suppresses_the_bit_pattern_that_makes_0x20():
+    """Why `space_ratio` separates, now that "roughly uniform" is gone.
+
+    Resampling a bit stream at the wrong clock turns each sampled byte into a
+    few long RUNS -- the sample window straddles whole tx bit times, so it
+    picks up blocks of like bits. 0x20 is the opposite shape: a single
+    isolated set bit in a field of zeros. So the process that produces
+    misframed bytes structurally under-produces exactly the value console
+    text is richest in.
+
+    Two independent measurements of that, both against the committed
+    simulator, and both stated as ratios between the two populations so
+    neither can rot into a bare literal.
+    """
+    misframed_bytes = b"".join(d for *_, d in MISFRAMED)
+    genuine_bytes = _uart.BOOT_LOG
+
+    def share(data, predicate):
+        return sum(1 for b in data if predicate(b)) / len(data)
+
+    # A byte that is a single unbroken block of 0s or 1s: what resampling
+    # makes, and what ASCII text never contains.
+    assert share(genuine_bytes, lambda b: _bit_runs(b) <= 2) == 0.0
+    assert share(misframed_bytes, lambda b: _bit_runs(b) <= 2) > 0.05
+
+    # The six values shaped like 0x20 -- one set bit, isolated. Console text
+    # is made of them; misframed bytes are not.
+    isolated = {b for b in range(256)
+                if bin(b).count("1") == 1 and _bit_runs(b) == 3}
+    assert 0x20 in isolated
+    genuine_share = share(genuine_bytes, lambda b: b in isolated)
+    misframed_share = share(misframed_bytes, lambda b: b in isolated)
+    assert genuine_share > 5 * misframed_share, (genuine_share,
+                                                 misframed_share)
+
+    # The high-bit bias the same process produces, for completeness: stop and
+    # idle bits are 1 and ASCII's top bit is always 0.
+    assert share(genuine_bytes, lambda b: b & 0x80) == 0.0
+    assert share(misframed_bytes, lambda b: b & 0x80) > 0.5
+
+
+def test_no_misframed_sample_reaches_the_space_ratio_reference():
+    """`space_ratio` is the factor a wrong rate cannot fake, pinned directly.
+
+    Every genuine variety reaches `SPACE_RATIO_REFERENCE` and so is not
+    penalised at all; no misframed sample of a workable length does.
+
+    The length floor is honest rather than convenient: one sample in the
+    fixture is 9 bytes long (tx=3 000 000 heard at 9 600) and a single space
+    in it reads as 0.111, over the reference. That is counting noise at n=9,
+    not evidence about the mechanism -- and it cannot win regardless, since
+    its `console_score` is still a fifth of the bar. Above 16 bytes the
+    highest misframed `space_ratio` in the whole population is 0.084.
+    """
+    for name, sample in GENUINE.items():
+        assert score_sample(sample)["space_ratio"] >= SPACE_RATIO_REFERENCE, name
+    workable = [(tx, rx, d) for _, tx, rx, d in MISFRAMED if len(d) >= 16]
+    # Relational, so the length filter can never quietly empty the list and
+    # make every assertion below vacuous.
+    assert len(workable) > 0.9 * len(MISFRAMED), (len(workable),
+                                                  len(MISFRAMED))
+    for tx, rx, data in workable:
+        assert score_sample(data)["space_ratio"] < SPACE_RATIO_REFERENCE, (
+            tx, rx, len(data), score_sample(data)["space_ratio"])
+
+
+def test_short_windows_of_misframed_bytes_clear_neither_gate():
+    """`line_structure`'s known weak spot, attacked deliberately.
+
+    Below `MAX_PLAUSIBLE_LINE_LENGTH` bytes `expected` floors at 1.0, so a
+    single terminator anywhere in a short window scores `line_structure` 1.0.
+    A scan accumulates bytes across sweeps, but early in a scan -- or at a
+    slow rate -- a candidate's sample really is this short, so the question
+    is whether some window of misframed bytes can get through on that.
+
+    It cannot, and the conjunction is what stops it: short windows do push
+    `console_score` up (the worst reaches about 0.39, well over
+    `WIRING_SUSPECT_CONSOLE_MAX`), but none of them clears the winner bar and
+    the printable gate together. Would catch `looks_like_console` weakened to
+    either bar alone, which is the change this window population is sized to
+    punish.
+    """
+    checked = 0
+    for _, tx, rx, data in MISFRAMED:
+        for width in (16, 32, 64, 128, 256):
+            for i in range(0, len(data) - width + 1, max(1, width // 2)):
+                scored = score_sample(data[i:i + width])
+                checked += 1
+                assert not looks_like_console(scored), (tx, rx, i, width,
+                                                        scored)
+    # Relational non-vacuity guard: every sample must have contributed
+    # windows, so a fixture change cannot silently reduce this to nothing.
+    assert checked > 10 * len(MISFRAMED), (checked, len(MISFRAMED))
+
+
+def test_a_receiver_faster_than_the_transmitter_produces_nothing_scorable():
+    """The other direction, which `MISFRAMED` deliberately does not sweep.
+
+    See `OVERSAMPLED`: the whole `rx > tx` half costs 410 s to build for a
+    population whose worst `console_score` is 0.002, because oversampling
+    every bit yields long runs of 0x00 and 0xff. This keeps the direction
+    under test at the one pair where it is cheap, so the claim in
+    `MISFRAMED`'s docstring is checked rather than merely asserted.
+    """
+    assert OVERSAMPLED, "the fast-receiver fixture must not be empty"
+    for gap, tx, rx, data in OVERSAMPLED:
+        scored = score_sample(data)
+        assert data, (gap, tx, rx)
+        assert scored["console_score"] == 0.0, (gap, tx, rx, scored)
+        assert not looks_like_console(scored), (gap, tx, rx, scored)
 
 
 def test_no_misframed_sample_is_ever_crowned_a_winner():
@@ -382,15 +642,16 @@ def test_no_misframed_sample_is_ever_crowned_a_winner():
     against an absolute bar, and any threshold set below the top of the
     garbage population.
     """
-    for gap, rate, data in MISFRAMED:
-        assert pick_winner({rate: data}) is None, (gap, rate,
-                                                   score_sample(data))
+    for gap, tx, rx, data in MISFRAMED:
+        assert pick_winner({rx: data}) is None, (gap, tx, rx,
+                                                 score_sample(data))
 
 
 def test_the_genuine_rate_wins_against_the_whole_misframed_field():
     """The bench's actual scan, end to end through the scorer: the real rate
     against every wrong rate in the ladder, all sampled at once."""
-    samples = {rate: data for _, rate, data in MISFRAMED if rate != 1500000}
+    samples = {rx: data for gap, tx, rx, data in MISFRAMED
+               if rx != 1500000 and tx == _uart.ROCKCHIP_CONSOLE_BAUD}
     samples[1500000] = _uart.BOOT_LOG
     assert pick_winner(samples) == 1500000
     assert rank_candidates(samples)[0]["rate"] == 1500000
@@ -519,9 +780,29 @@ def test_the_wiring_hint_also_names_a_rate_outside_the_candidate_list():
 
     The hint named only ground and TX/RX, so a rig whose only fault was a
     console rate above the ladder was told to inspect wire that was fine.
-    Would catch the third cause being dropped when the hint is next reworded.
+    Would catch the fourth cause being dropped when the hint is next reworded.
     """
     text = GROUND_CROSSOVER_HINT.lower()
     assert "ground" in text
     assert "tx" in text and "rx" in text
     assert "rates" in text or "candidate list" in text
+
+
+def test_the_hint_names_sparse_traffic_as_a_cause():
+    """The most likely cause in practice, and the one the hint lacked.
+
+    A later bench session scanned a live Rockchip target and found nothing at
+    any rate: wiring correct, 1 500 000 in the ladder, and the board's whole
+    boot burst about 55 ms of wire time. The line was simply idle. An
+    operator handed only "check ground, check TX/RX, widen the rates" will
+    work through three correct-and-useless checks before considering that
+    there was nothing to hear.
+
+    Would catch the cause being dropped or softened into a rates suggestion
+    when the hint is next reworded.
+    """
+    text = GROUND_CROSSOVER_HINT.lower()
+    assert "idle" in text or "not talking" in text
+    assert "boot" in text, "the burst case has to be named, not just idleness"
+    assert "power-cycle" in text or "provoke" in text, (
+        "naming the cause without naming the action leaves the operator stuck")

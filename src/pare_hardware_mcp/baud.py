@@ -66,15 +66,40 @@ SPACE_RATIO_REFERENCE = 0.10
 The single most reliable separator found, and the one that survives console
 output with no words in it at all. Console text -- boot logs, hexdumps,
 shell sessions, bootloader banners -- is column- and token-separated, so
-0x20 is its most common byte by a wide margin: measured 0.105-0.33 across
-every genuine fixture in `tests/unit/_uart.py`, including a hexdump and a
-timestamp-only kernel log, both of which have ZERO runs of three letters.
+0x20 is its most common byte by a wide margin. Every variety in
+`tests/unit/test_baud.py`'s `GENUINE` reaches this reference and is therefore
+not penalised at all, including a hexdump and a timestamp-only kernel log,
+both of which have ZERO runs of three letters;
+`test_no_misframed_sample_reaches_the_space_ratio_reference` asserts that,
+and re-checks it against any variety added later.
 
-Misframed bytes do not concentrate on any single value: re-sampling a fast
-waveform at a slow clock spreads the result across the reachable byte values
-roughly evenly, so no value -- 0x20 included -- gets more than a few percent.
-Measured 0.000-0.036 across 74 physically simulated resamplings of a real
-1.5 Mbaud boot log at every wrong candidate rate.
+WHY MISFRAMED BYTES CANNOT FAKE IT -- and this is NOT because they spread out
+evenly. An earlier version of this docstring said resampling "spreads the
+result across the reachable byte values roughly evenly, so no value -- 0x20
+included -- gets more than a few percent". That is false, and it was the
+stated reason behind the strongest factor here, so it is worth being exact:
+measured against the committed simulator, one misframed sample is 96% a
+SINGLE byte value and some contain as few as three distinct values. The
+distribution is violently concentrated.
+
+It is concentrated on the wrong SHAPE, which is the real mechanism. A
+receiver clocked wrongly samples across whole transmitter bit times, so each
+byte it delivers is a few long RUNS of like bits -- blocks of 0s and 1s,
+which is why 0x00 and 0xff dominate. Measured: 8% of misframed bytes are a
+single unbroken run, against none at all of the genuine log's. 0x20 is the
+opposite shape -- one isolated set bit in a field of zeros -- and the six
+byte values with that shape are an eighth as common in misframed bytes as in
+console text. (The same process also biases the top bit high, since stop and
+idle bits are 1 while ASCII's MSB is always 0: bit 7 is set in 59% of
+misframed bytes and 0% of the log. That is a real effect but a secondary
+one.)
+
+A maintainer weighing whether this factor is redundant must reason from that
+mechanism rather than from "roughly uniform", which points the opposite way.
+`test_misframing_suppresses_the_bit_pattern_that_makes_0x20` and
+`test_misframed_bytes_are_concentrated_rather_than_uniform` hold both halves
+of it down; they assert ratios between the two populations rather than the
+percentages quoted here, so the argument is checked even as the figures move.
 
 Used as `min(1.0, space_ratio / SPACE_RATIO_REFERENCE)`, so clearing it earns
 no extra credit: a chatty log with 25% spaces and a terse one with 11% score
@@ -88,10 +113,14 @@ MAX_PLAUSIBLE_LINE_LENGTH = 200.0
 
 Console output is line-oriented; misframed bytes are not. `\\r\\n` is the
 strongest single piece of evidence there is, because it is a TWO-byte
-sequence: for bytes distributed even roughly uniformly it appears about once
-in 16 000, where real console text emits one every 40-80 bytes. Measured: 0
-occurrences in every one of the 74 simulated misframings, against 74 in the
-3378-byte genuine log.
+sequence: it has to survive the resampling twice in a row, in order. Measured
+against the committed simulator: ZERO occurrences across the entire misframed
+population, at every ordered rate pair in the ladder with a slower receiver,
+while the genuine log emits one every ~45 bytes. Both halves are asserted by
+`tests/unit/test_baud.py` rather than quoted as counts here -- the counts in
+this docstring had already drifted from the fixture once (it named 74 CRLFs
+in a 3378-byte log; the log is 2415 bytes with 53) precisely because nothing
+checked them.
 
 Same normalising shape as `SPACE_RATIO_REFERENCE`: a sample is expected to
 carry at least `len(data) / MAX_PLAUSIBLE_LINE_LENGTH` terminators, and more
@@ -139,12 +168,28 @@ def score_sample(data: bytes) -> dict:
     printable-looking bytes with plausible `\\r\\n` sprinkled in -- which
     scores 0.788 printable and 0.044 console.
 
-    Measured separation, all reproduced by `tests/unit/test_baud.py`:
+    The separation is stated as RELATIONSHIPS and asserted in
+    `tests/unit/test_baud.py`, not as literals here. Literals are what this
+    docstring carried before, and every one of them had drifted from the
+    fixture it claimed to describe -- a population of 60 samples was called
+    74, and "ten varieties" of genuine output were six. Nothing asserted any
+    of them, so nothing caught it. What the suite now pins:
 
-    - genuine console output, ten varieties, 256 B to 4.7 KB:  >= 0.744
-    - the same log misframed, 74 physical resamplings:         <= 0.074
-    - engineered noise at the bench's 0.78 printable + CRLF:      0.044
-    - high-bit noise (a floating ground) and a silent line:       0.000
+    - every variety of genuine console output in `GENUINE` clears
+      `WINNER_CONSOLE_THRESHOLD` by a comfortable factor, and adding a
+      variety re-checks the claim
+      (`test_every_genuine_variety_clears_the_winner_bar_with_margin`)
+    - the whole misframed population scores a small fraction of that same
+      bar, and the genuine floor is several times the misframed ceiling
+      (`test_every_misframed_sample_scores_a_fraction_of_the_winner_bar`)
+    - engineered noise aimed at this discriminator -- printable bytes with
+      plausible `\r\n` inserted -- still cannot win
+      (`test_noise_that_looks_printable_and_has_crlf_still_does_not_win`)
+    - high-bit noise (a floating ground) and a silent line score 0.0
+      (`test_a_silent_line_and_a_floating_ground_both_score_zero`)
+
+    To see the current numbers rather than the relationships, run the suite:
+    `./.venv/bin/python -m pytest tests/unit/test_baud.py -q`.
 
     KNOWN GAP -- `framing_errors` IS SPECIFIED AND IS NOT MEASURED HERE.
     The spec asks for a `framing_errors` count alongside these fields;
@@ -225,6 +270,43 @@ def sort_key(scored: dict) -> tuple:
 # -- plan-supplied code -- but it is pure (no hardware, no I/O) and unit --
 # -- tested the same way. -----------------------------------------------
 
+# ---------------------------------------------------------------------------
+# WHAT THIS SCAN CAN AND CANNOT MEASURE, and how the rate actually gets found
+# when it cannot. Recorded here so the next reader does not re-derive a dead
+# end that has already cost one bench session.
+#
+# This scan detects the rate of a line that is TALKING while it listens. It
+# does not reliably detect a boot burst. Measured on the bench: a Rockchip
+# target's entire boot output is about 55 ms of wire time at 1 500 000 baud.
+# A scan samples one candidate at a time, so catching that burst means having
+# the right rate selected during those 55 ms -- which is luck, not detection,
+# and sweeping only improves the odds, it does not make them good. The scan
+# against that target found NOTHING at any rate, with correct wiring and with
+# 1 500 000 in the ladder.
+#
+# The rate was established by sweeping with a ~200 ms dwell while the operator
+# power-cycled the board BY HAND, repeatedly, until a sweep and a boot
+# overlapped. It came back 1 500 000. That works, and it is not automation.
+#
+# The two real measurement paths, for when this scan comes back empty:
+#
+#   1. A LOGIC ANALYSER on the target's TX line. Capture the burst once and
+#      read the bit period off it directly. This measures the rate rather
+#      than inferring it from how plausible the bytes look, and it does not
+#      care how short the burst is.
+#   2. A POWER-CONTROL RELAY the agent can switch, so the target can be
+#      power-cycled under program control and the scan run across a boot the
+#      agent CHOSE the moment of. That converts the luck above into a
+#      controlled experiment. Planned for phase 2.
+#
+# AUTODETECTION IS NOT BEING INVESTED IN FURTHER. The scoring below is good
+# at what it does -- see `score_sample` for the measured separation -- and
+# the limit it runs into is not the scorer's accuracy, it is that a sampling
+# scan cannot be listening everywhere at once. An operator who knows the rate
+# should pass it rather than scan for it, and the contract text for
+# `console_detect_baud` says so.
+# ---------------------------------------------------------------------------
+
 DEFAULT_DWELL_SECONDS = 0.2
 """How long one candidate is listened to in ONE pass of the sweep.
 
@@ -294,16 +376,20 @@ WINNER_CONSOLE_THRESHOLD = 0.5
 """How high a candidate's `console_score` must be to be left live.
 
 Placed from measurement, not from taste, and the band it sits in is wide in
-both directions:
+both directions. The populations either side are `tests/unit/test_baud.py`'s
+`GENUINE` (boot log, 256-byte slice, LF-only console, U-Boot banner, hexdump,
+timestamp-only kernel log) and `MISFRAMED` (every ordered pair of default
+rates with a slower receiver, across six transmitter timings). The suite
+asserts the relationship in both directions -- that the threshold sits below
+every genuine variety with margin and above the whole misframed population by
+a multiple -- rather than pinning either edge to a number.
 
-- genuine console output, ten varieties (boot log, 256-byte slice, LF-only
-  console, hexdump, timestamp-only kernel log, busybox session, U-Boot
-  banner): >= 0.744. This threshold is 1.5x below the worst of them.
-- the same 1.5 Mbaud boot log misframed at every wrong candidate rate,
-  74 physically simulated resamplings: <= 0.074. This threshold is 6.8x
-  above the best of them.
-- engineered noise at the bench's measured printable ratio WITH plausible
-  `\r\n` inserted, i.e. an adversary aimed at exactly this test: 0.044.
+That is deliberate. This docstring previously quoted both edges as literals
+and named the sizes of both populations, and all four figures were wrong
+against the committed fixtures, because no test read them. A threshold is
+only ever as good as the gap either side of it, so the GAP is what the suite
+now checks; `./.venv/bin/python -m pytest tests/unit/test_baud.py -q` is what
+reports the figures of the day.
 
 Compare the quantity it replaces: on the bench's real numbers,
 `printable_ratio` separated the genuine winner from the garbage by 0.911
@@ -314,9 +400,10 @@ WIRING_SUSPECT_CONSOLE_MAX = 0.25
 """Below this `console_score`, a candidate is not "a worse rate" -- it is
 evidence that nothing on this line resembled console output at that speed.
 
-Sits between the two populations measured above, nearer the garbage: every
-simulated misframing scores under 0.074, so the hint fires reliably when a
-scan really did see nothing but noise, while the band 0.25-0.5 is left for
+Sits between the two populations measured above, nearer the garbage: the
+whole simulated misframed population scores well under this, so the hint
+fires reliably when a scan really did see nothing but noise, while the band
+between this and `WINNER_CONSOLE_THRESHOLD` is left for
 the marginal candidate -- plausible text with real corruption, a rate near
 the right one, worth retrying -- which must not draw a wiring accusation.
 Calibrated against a corruption sweep of the genuine log: a link corrupting
@@ -363,12 +450,17 @@ def looks_like_console_bytes(data: bytes) -> bool:
 
 GROUND_CROSSOVER_HINT = (
     "Nothing on this line looked like console output at any candidate rate. "
-    "Three causes produce that same evidence and the scan cannot tell them "
+    "Four causes produce that same evidence and the scan cannot tell them "
     "apart: (1) ground is not connected between the adapter and the target -- "
     "a floating ground produces framing errors that look exactly like a wrong "
     "baud rate; (2) TX/RX are swapped -- the adapter's TX must reach the "
-    "target's RX and vice versa; (3) the target's rate is not in the "
-    "candidate list -- pass `rates` explicitly if you know the part. Check "
+    "target's RX and vice versa; (3) the line is idle because the target is "
+    "not talking -- it has already finished booting, or it only answers when "
+    "spoken to. This scan can only read a rate off a line that is actually "
+    "chattering; a boot burst is milliseconds of wire time and will be missed. "
+    "Power-cycle the target and scan across the boot, or send a newline to "
+    "provoke a prompt; (4) the target's rate is not in the candidate list -- "
+    "pass `rates` explicitly if you know the part. Check "
     "the two wiring causes first: they cost one look each, and a rate list "
     "widened against a floating ground will fail at every rate too."
 )
@@ -381,7 +473,7 @@ only one of them is silence. A wrong crossover just produces silence, which
 framing errors that score exactly like a wrong baud rate, and that is the
 case where the hint changes what an operator does.
 
-THE THIRD CAUSE WAS ADDED FROM THE BENCH, and it was the one that actually
+THE FOURTH CAUSE WAS ADDED FROM THE BENCH, and it was the one that actually
 happened: the target's console ran at 1 500 000, `DEFAULT_RATES` stopped at
 921 600, and this hint -- which at the time named only the two wiring faults
 -- was attached to a rig whose wiring was perfectly correct. The earlier
@@ -389,9 +481,21 @@ version of this docstring argued that "the rate list was wrong" was the less
 likely half of the pair because the defaults "already covers every common
 console speed". That was the assumption the bench falsified, and the list
 having been widened since does not make the assumption safe to keep: the next
-part with an unusual rate produces exactly this again. Naming all three, and
+part with an unusual rate produces exactly this again. Naming all of them, and
 ordering them by what costs the operator least to check, is what the hint can
 honestly say.
+
+SPARSE TRAFFIC came from a later bench session and is, in practice, the most
+likely of the four. A scan against a live Rockchip target found nothing at
+any rate -- not because of wiring and not because of the ladder, but because
+the board's entire boot burst is about 55 ms of wire time at 1.5 Mbaud and a
+sampling scan cannot reliably be listening when it lands. The line was
+genuinely idle for everything else the scan saw. That is the ordinary state
+of a target that has finished booting, and of anything that only speaks when
+spoken to, so the hint has to name it; an operator told to check wiring and
+rates while the real answer is "there was nothing to hear" will not get
+there on their own. It is listed third rather than first only because the
+two wiring checks are cheaper to perform, not because it is rarer.
 """
 
 
