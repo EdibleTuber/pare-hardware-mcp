@@ -248,11 +248,24 @@ class ConsoleSession:
                     if start_cursor <= g["at_cursor"] <= end_cursor]
 
     def gap_summary(self) -> dict:
-        """Count and total seconds of every capture suspension so far."""
+        """Count and total seconds of every capture suspension, PLUS whether
+        one is happening right now.
+
+        `total_seconds` sums each entry's `duration_s` -- which is a
+        placeholder (0.0) for whichever entry is still `in_progress`, so a
+        suspension in its 12th second reads as "0.0s" here. That pairing --
+        count: 1, seconds: 0.0 -- looks like "a gap of zero length", which is
+        as misleading as reporting no gap at all: it is the exact reasoning
+        hazard this ledger exists to prevent, just relocated from "invisible"
+        to "invisible AND presented as a number". `capture_suspended` is the
+        explicit signal a caller needs instead of inferring "in progress"
+        from a seconds value that cannot show it.
+        """
         with self._gaps_lock:
             return {
                 "count": len(self._gaps),
                 "total_seconds": round(sum(g["duration_s"] for g in self._gaps), 3),
+                "capture_suspended": any(g["in_progress"] for g in self._gaps),
             }
 
     @property
@@ -475,11 +488,15 @@ class ConsoleSession:
         gap in the boot log a caller could otherwise reason straight across.
         Unlike `"rejected"`, that gap is not only reported after the fact:
         `_record_gap` is called the instant the reader parks (`"in_progress":
-        True`, a placeholder duration), so a concurrent `console_status` or
-        `console_read` sees it WHILE it is happening, not only on the next
-        call once this one has returned -- `_finish_gap` fills in the real
-        duration when the scan ends, whatever the reason. Returned here as
-        `"gap"`.
+        True`, a placeholder duration), so a concurrent `console_read` sees
+        it (via `gaps_overlapping`) WHILE it is happening, not only on the
+        next call once this one has returned. A concurrent `console_status`
+        sees `capture_suspended: True` the same way -- but NOT a `duration_s`
+        that has grown to match: `gap_summary`'s `total_seconds` sums each
+        entry's `duration_s`, which is still the 0.0 placeholder for the
+        in-progress one, so `capture_suspended` is the explicit signal, not
+        the seconds. `_finish_gap` fills in the real duration when the scan
+        ends, whatever the reason. Returned here as `"gap"`.
 
         Raises `SessionError` for a bad rate list, a session that is not
         alive, a reader that will not park, or a `decide` callback that
@@ -640,7 +657,14 @@ class ConsoleSession:
                     self.baud = final_baud
             finally:
                 self._scan_pause.clear()
-                if gap_start_time is not None:
+                # Guarded on `gap_entry`, NOT `gap_start_time`: the latter is
+                # set one line before `_record_gap` is called, so anything
+                # raising in that narrow window (essentially unreachable --
+                # `_record_gap` only does a dict literal and a lock-guarded
+                # append -- but not provably impossible) would otherwise call
+                # `_finish_gap(None, ...)` and mask the real exception behind
+                # a bare TypeError.
+                if gap_entry is not None:
                     self._finish_gap(gap_entry, time.monotonic() - gap_start_time)
         finally:
             self._write_lock.release()
@@ -783,6 +807,7 @@ class ConsoleSession:
             "dropped": dropped,
             "capture_gap_count": gaps["count"],
             "capture_gap_seconds": gaps["total_seconds"],
+            "capture_suspended": gaps["capture_suspended"],
         }
 
 
@@ -798,7 +823,7 @@ class SessionManager:
         "open", "session", "device", "tty", "serial", "interface", "baud",
         "flow", "dtr", "rts", "opened_at", "age_s", "alive", "death_reason",
         "buffer_head", "buffer_capacity", "dropped",
-        "capture_gap_count", "capture_gap_seconds",
+        "capture_gap_count", "capture_gap_seconds", "capture_suspended",
     )
 
     def __init__(self, *, capacity: int = DEFAULT_CAPACITY) -> None:

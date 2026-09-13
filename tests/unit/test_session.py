@@ -1354,16 +1354,20 @@ def test_a_gap_is_visible_in_status_as_a_running_count_and_total(manager, pty):
     before = manager.status()
     assert before["capture_gap_count"] == 0
     assert before["capture_gap_seconds"] == 0
+    assert before["capture_suspended"] is False
 
     session.scan_baud((9600, 115200), 0.1, no_op_decide)
     after_one = manager.status()
     assert after_one["capture_gap_count"] == 1
     assert after_one["capture_gap_seconds"] > 0
+    assert after_one["capture_suspended"] is False, \
+        "the scan already returned; nothing should still read as in progress"
 
     session.scan_baud((9600, 115200), 0.1, no_op_decide)
     after_two = manager.status()
     assert after_two["capture_gap_count"] == 2
     assert after_two["capture_gap_seconds"] > after_one["capture_gap_seconds"]
+    assert after_two["capture_suspended"] is False
 
 
 def test_a_gap_is_visible_while_the_scan_is_still_running(manager, pty):
@@ -1392,6 +1396,12 @@ def test_a_gap_is_visible_while_the_scan_is_still_running(manager, pty):
     mid_scan_status = manager.status()
     assert mid_scan_status["capture_gap_count"] == 1, \
         "the gap must be counted the instant the reader parks, not only once the scan ends"
+    # N2: `capture_gap_seconds` is 0.0 here (the in-progress entry's duration
+    # is still its placeholder) -- pairing count:1 with seconds:0.0 reads as
+    # "a gap of zero length", which is exactly as misleading as count:0. This
+    # explicit flag is the signal a caller must use instead.
+    assert mid_scan_status["capture_gap_seconds"] == 0.0
+    assert mid_scan_status["capture_suspended"] is True
     mid_scan_gaps = session.gaps_overlapping(cursor_before, cursor_before + 1)
     assert len(mid_scan_gaps) == 1
     assert mid_scan_gaps[0]["in_progress"] is True
@@ -1399,6 +1409,7 @@ def test_a_gap_is_visible_while_the_scan_is_still_running(manager, pty):
 
     thread.join(DEADLINE)
     assert scan_done.is_set()
+    assert manager.status()["capture_suspended"] is False
     # And once it's over, the SAME entry is finalised, not duplicated.
     assert manager.status()["capture_gap_count"] == 1
     finished = session.gaps_overlapping(cursor_before, cursor_before + 1)
@@ -1420,6 +1431,31 @@ def test_a_failed_scan_still_records_its_gap(manager, pty):
         session.scan_baud((9600, 115200), 0.1, exploding_decide)
 
     assert manager.status()["capture_gap_count"] == 1
+
+
+def test_finish_gap_guard_does_not_mask_an_exception_from_record_gap(manager, pty):
+    """MINOR N4: `gap_start_time` is set one line before `gap_entry` in
+    `scan_baud`. Guarding the `finally` on `gap_start_time is not None`
+    (round 1/2's shape) means anything raising in that narrow window calls
+    `_finish_gap(None, ...)`, a bare TypeError masking whatever actually
+    went wrong. Guarding on `gap_entry is not None` instead means the real
+    exception -- simulated here via `_record_gap` itself raising -- comes
+    through unmodified.
+    """
+    session = open_ok(manager, pty)
+
+    def exploding_record_gap(*args, **kwargs):
+        raise RuntimeError("boom from _record_gap")
+
+    session._record_gap = exploding_record_gap
+    with pytest.raises(RuntimeError, match="boom from _record_gap"):
+        session.scan_baud((9600, 115200), 0.1, no_op_decide)
+
+    # And the session is not left wedged: the write lock and scan-pause
+    # state were still released despite the exception.
+    assert session._write_lock.acquire(timeout=1.0)
+    session._write_lock.release()
+    assert not session._scan_pause.is_set()
 
 
 def test_gaps_overlapping_flags_only_gaps_inside_the_requested_window(manager, pty):

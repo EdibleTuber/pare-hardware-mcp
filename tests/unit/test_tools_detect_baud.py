@@ -141,7 +141,11 @@ async def test_a_rate_list_of_only_invalid_values_is_refused(monkeypatch):
 async def test_a_winner_is_reported_and_the_session_is_left_there(monkeypatch):
     session = FakeSession(scan_result=winner_result(original=9600, final=115200))
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    # Matches winner_result()'s two sampled rates exactly: the verdict logic
+    # gates on every REQUESTED candidate having actually been attempted
+    # (samples + rejected), so a mismatched rates= here would misreport this
+    # as an aborted scan even though the fake never aborted anything.
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
 
     assert out["verdict"] == "winner"
     assert out["final_baud"] == 115200
@@ -174,7 +178,7 @@ async def test_no_clear_winner_reports_the_restored_rate(monkeypatch):
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
     assert out["verdict"] == "no_clear_winner"
     assert "9600" in out["note"]
     assert "hint" not in out
@@ -189,7 +193,7 @@ async def test_a_totally_silent_line_names_ground_and_crossover(monkeypatch):
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
     assert out["verdict"] == "no_data_at_any_rate"
     assert "ground" in out["hint"].lower()
     assert "tx" in out["hint"].lower() and "rx" in out["hint"].lower()
@@ -210,10 +214,19 @@ async def test_all_candidates_rejected_is_distinguished_from_a_silent_line(monke
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    # Matches the two rejected rates exactly -- see the comment on the
+    # winner test above for why a mismatch here would misreport this.
+    out = json.loads(await tools.console_detect_baud(rates=[250000, 999999]))
     assert out["verdict"] == "all_candidate_rates_rejected"
     assert "hint" not in out
-    assert out["rejected"] == {"250000": "kernel rejected it", "999999": "kernel rejected it"}
+    # A list of {rate, reason}, matching `candidates`' shape -- not
+    # session.py's {rate: reason} dict, whose int keys would otherwise
+    # travel over JSON coerced to strings while `candidates[]["rate"]`
+    # stays an int for the same kind of value in the same response.
+    assert out["rejected"] == [
+        {"rate": 250000, "reason": "kernel rejected it"},
+        {"rate": 999999, "reason": "kernel rejected it"},
+    ]
 
 
 async def test_a_partial_rejection_still_reports_ranked_evidence(monkeypatch):
@@ -226,10 +239,54 @@ async def test_a_partial_rejection_still_reports_ranked_evidence(monkeypatch):
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
-    out = json.loads(await tools.console_detect_baud())
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 250000]))
     assert out["verdict"] != "all_candidate_rates_rejected"
+    assert out["verdict"] != "scan_aborted"
     assert {c["rate"] for c in out["candidates"]} == {9600}
-    assert out["rejected"] == {"250000": "kernel rejected it"}
+    assert out["rejected"] == [{"rate": 250000, "reason": "kernel rejected it"}]
+
+
+# --------------------------------------------------------------------------
+# New: a scan that stopped early (a concurrent close, or the device dying
+# mid-scan) must not be misreported as one of the completed verdicts above.
+# --------------------------------------------------------------------------
+
+async def test_a_scan_aborted_partway_gets_its_own_verdict(monkeypatch):
+    """Reproduces the reviewer's finding: samples={}, one rejection recorded,
+    then the loop broke on _stop/_closing before trying the rest. Before this
+    fix, `not samples and rejected` alone would have called this
+    "all_candidate_rates_rejected" -- false, because the untried rates were
+    never even attempted, let alone rejected.
+    """
+    result = {
+        "samples": {},
+        "rejected": {333333: "kernel rejected it"},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": True,  # racy and still True at this instant -- must not be relied on
+        "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    # Three requested, only one ever attempted (and rejected).
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 333333, 115200]))
+    assert out["verdict"] == "scan_aborted"
+    assert "1 of 3" in out["note"]
+    assert "hint" not in out
+
+
+async def test_a_fully_completed_all_rejected_scan_is_not_misreported_as_aborted(monkeypatch):
+    """The companion case: every candidate WAS attempted, so this is the
+    real "all_candidate_rates_rejected" verdict, not "scan_aborted"."""
+    result = {
+        "samples": {},
+        "rejected": {9600: "x", 115200: "x"},
+        "original_baud": 9600, "final_baud": 9600, "restored": True,
+        "alive": True, "death_reason": None, "gap": GAP,
+    }
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert out["verdict"] == "all_candidate_rates_rejected"
 
 
 # --------------------------------------------------------------------------

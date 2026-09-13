@@ -205,15 +205,44 @@ async def console_detect_baud(device: str | None = None,
         # A candidate the hardware itself rejected at apply time (not a
         # sanitize_rates/scan_baud ceiling refusal, which never reaches
         # here) -- named per rate, alongside whatever candidates DID get
-        # sampled. Never thrown away wholesale over one bad rate.
-        rejected=result["rejected"],
+        # sampled. Never thrown away wholesale over one bad rate. A list of
+        # {rate, reason}, matching `candidates`' shape: session.py's
+        # {rate: reason} dict would travel over JSON with its int keys
+        # coerced to strings, so a caller correlating a rejected rate
+        # against `candidates[]["rate"]` (an int) would see mismatched
+        # types for the same kind of value in the same response.
+        rejected=[{"rate": rate, "reason": reason}
+                 for rate, reason in result["rejected"].items()],
         # This scan suspended the reader for the duration of the sampling --
         # a real hole in the boot log, not just an implementation detail.
-        # Also visible later via console_status (running totals) and
-        # console_read (flagged on whichever read's window crosses it).
+        # Also visible via console_status (running count/seconds, plus
+        # capture_suspended -- seconds alone reads as 0.0 for a gap still in
+        # progress, which is why that flag exists) and console_read (flagged
+        # on whichever read's window crosses it).
         capture_gap=result["gap"],
     )
-    if not samples and result["rejected"]:
+    requested = len(candidate_rates)
+    attempted = len(samples) + len(result["rejected"])
+    if attempted < requested:
+        # The loop stopped early (session.py: _stop/_closing observed
+        # mid-scan -- a concurrent close, or the device disappearing) before
+        # every candidate could even be tried. `alive` is not a safe signal
+        # here: it is read after `scan_baud` releases `_write_lock`, which
+        # is exactly what a racing `_shutdown` was waiting on, so it can
+        # still read True in the instant this response is built. The
+        # attempted-vs-requested COUNT is not racy -- `samples` and
+        # `rejected` are populated by this one scan and nothing else -- so
+        # it is what decides this, not `alive`. An aborted scan gets its own
+        # verdict: falling through to "all candidates rejected" or "no data"
+        # below would claim every candidate was tried when most never were.
+        response["verdict"] = "scan_aborted"
+        response["note"] = (
+            f"the scan stopped after {attempted} of {requested} candidate "
+            "rate(s) -- the session is closing or the device disappeared "
+            "mid-scan; ranked evidence and rejections cover only what was "
+            "actually attempted"
+        )
+    elif not samples and result["rejected"]:
         # Distinct from a genuinely silent line: nothing was ever sampled
         # because every candidate was refused before a byte could be read,
         # so the ground/TX-RX-crossover hint below would be actively
