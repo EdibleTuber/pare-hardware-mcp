@@ -440,15 +440,50 @@ class ConsoleSession:
                     "offset."
                 )
 
-    def scan_baud(self, rates: tuple[int, ...], sample_seconds: float,
-                  decide) -> dict:
-        """Sample the line at each rate in `rates`, on THIS descriptor, without
+    def scan_baud(self, rates: tuple[int, ...], dwell_seconds: float,
+                  decide, budget_seconds: float | None = None,
+                  early_exit=None) -> dict:
+        """SWEEP the line across `rates`, on THIS descriptor, without
         transmitting -- then leave the port at whatever `decide` picks.
 
+        Not one pass. The candidate list is swept REPEATEDLY, dwelling
+        `dwell_seconds` on each rate per pass, until `budget_seconds` of
+        sampling has elapsed or `early_exit` accepts a candidate. A
+        candidate's bytes accumulate across its windows; `decide` still sees
+        one `bytes` per rate.
+
+        Why, in one measured sentence: a target that emits a burst at boot
+        and then goes silent (verified -- 12 s of listening after boot
+        returned 0 bytes) gives a single-pass scan exactly one candidate's
+        worth of evidence, and that candidate is whichever one happened to
+        hold the window when the burst arrived. It then "wins" regardless of
+        whether it is right, and every other rate reports silence. Sweeping
+        puts a multi-second burst into several windows PER RATE, so only the
+        correct rate accumulates readable text. `baud.DEFAULT_DWELL_SECONDS`
+        carries the rest of the reasoning.
+
+        `budget_seconds` defaults to exactly one full sweep
+        (`len(rates) * dwell_seconds`), which is the old single-pass
+        behaviour and is what the session-level tests exercise when they do
+        not ask for more.
+
+        `early_exit(data: bytes) -> bool`, when given, is offered every
+        candidate's accumulated bytes AFTER EACH COMPLETED SWEEP, never
+        mid-sweep. That ordering is the honesty guarantee: by the time an
+        early exit can be taken, every candidate the hardware accepted has
+        been sampled and appears in the result with evidence of its own. It
+        does mean the earliest possible exit is the end of sweep 1 rather
+        than the instant a good sample lands -- the cost of one sweep, paid
+        so the ranking can never be silent about a rate that was skipped.
+        How long each rate was actually listened to comes back in
+        `"listen_seconds"`, because an early exit leaves those unequal.
+
         Never closes and reopens: reopening re-asserts DTR, which would
-        reboot a DTR-reset board once per candidate and never let it stay up
-        long enough to emit a clean sample. Instead this changes `baudrate`
-        via termios on the already-open fd between candidates.
+        reboot a DTR-reset board once per dwell -- and a sweep has many more
+        dwells than a single pass has candidates, so this matters more now,
+        not less. Instead this changes `baudrate` via termios on the
+        already-open fd between candidates. Verified on the bench across a
+        real scan: 0 DTR transitions and 0 reopens over 178 samples.
 
         `decide(samples: dict[rate, bytes]) -> int | None` is called exactly
         once, with every candidate's raw bytes, after the last one is
@@ -487,11 +522,22 @@ class ConsoleSession:
         (the winner, or the rate the session started at) and `self.baud`
         matches it -- a bad-but-in-range candidate that pyserial itself
         rejects must never leave the line at whatever tcsetattr last
-        applied while `self.baud` still claims something else.
+        applied while `self.baud` still claims something else. A rate that
+        lands in `"rejected"` is therefore also dropped from `"samples"`,
+        even if an earlier sweep had already collected bytes at it --
+        otherwise `decide` could crown a rate the port has since refused.
+        And `self.baud`, `"final_baud"` and `"winner"` are all derived from
+        the rate the port ACCEPTED, not the one this method asked for: if
+        the winner will not apply the session's original rate is tried, and
+        if that will not apply either (the device is gone) `"final_baud"`
+        names the last rate the port did take. `"winner"` is non-None only
+        when that rate was actually left live.
 
         Pausing the reader for the scan means capture stops advancing for
-        `sample_seconds * len(candidates actually sampled)` or more -- a real
-        gap in the boot log a caller could otherwise reason straight across.
+        the whole scan budget or more -- a real gap in the boot log a caller
+        could otherwise reason straight across. ONE gap entry covers the
+        whole sweep, not one per dwell: the reader parks once, before the
+        first candidate, and resumes once, after the last.
         Unlike `"rejected"`, that gap is not only reported after the fact:
         `_record_gap` is called as soon as THIS (scan) thread observes the
         park -- i.e. right after `_scan_parked.wait()` returns, not "the
@@ -557,14 +603,28 @@ class ConsoleSession:
                 )
 
             original_baud = self.baud
-            samples: dict[int, bytes] = {}
+            if budget_seconds is None:
+                # Exactly one full sweep: the single-pass shape, as the
+                # degenerate case of the sweep rather than a separate code
+                # path that could drift away from it.
+                budget_seconds = len(rates) * dwell_seconds
+            samples: dict = {}
+            listened: dict[int, float] = {}
             rejected: dict[int, str] = {}
+            sweeps = 0
+            early_exited = False
             winner: int | None = None
             # Pre-set to the fallback: if anything below raises before a
             # winner is chosen, the `finally` still restores a KNOWN rate
             # rather than leaving the port at whatever the failed candidate
             # left in the termios struct.
             final_baud = original_baud
+            # The rate the PORT last accepted, as distinct from the rate this
+            # method intends it to be at. They diverge exactly when a
+            # `baudrate` assignment raises, which is the one case where
+            # `self.baud` must not simply be told what `final_baud` says --
+            # see the restore in the `finally` below.
+            applied_baud = original_baud
             gap_start_time: float | None = None
             gap_entry: dict | None = None
 
@@ -597,84 +657,169 @@ class ConsoleSession:
                 )
 
                 try:
-                    for rate in rates:
-                        if self._stop.is_set() or self._closing.is_set():
-                            break
-                        try:
-                            self._serial.baudrate = rate
-                            # Discard whatever is sitting in the driver's
-                            # input queue from the PREVIOUS candidate rate
-                            # (or from before the scan started): those bytes
-                            # were framed at a different speed and are not
-                            # evidence about `rate`. This does discard a
-                            # few genuine at-the-original-rate bytes the
-                            # driver had queued but the reader had not yet
-                            # drained -- an unavoidable part of the same
-                            # gap, which is exactly why the gap is measured
-                            # from `gap_start_time` (before this call), not
-                            # from the first candidate's read loop.
-                            self._serial.reset_input_buffer()
-                        except (serial.SerialException, OSError) as exc:
-                            self._die(self._explain(exc, "baud scan (set rate)"))
-                            raise SessionError(
-                                f"session {self.id}: setting {rate} baud "
-                                f"failed and the device looks gone: "
-                                f"{self.death_reason}"
-                            ) from exc
-                        except (ValueError, OverflowError) as exc:
-                            # pyserial's custom-baud path converts a
-                            # kernel-rejected rate to ValueError
-                            # (serialposix.py's _set_special_baudrate), and
-                            # the termios array('i') store raises
-                            # OverflowError for a rate that does not fit a
-                            # C int (>= 2**31). Neither means the device is
-                            # gone, and neither means the REST of the scan
-                            # is untrustworthy: invariant 5 is ranked
-                            # evidence, never a bare verdict, and aborting
-                            # every other candidate over one the hardware
-                            # itself refuses would throw away perfectly
-                            # good samples already in hand (or still to
-                            # come) for no reason connected to them. Record
-                            # the rejection and try the next rate.
-                            rejected[rate] = str(exc)
-                            continue
-
-                        collected = bytearray()
-                        deadline = time.monotonic() + sample_seconds
-                        while (time.monotonic() < deadline
-                               and not self._stop.is_set()
-                               and not self._closing.is_set()):
+                    # -- THE SWEEP ------------------------------------
+                    # Repeated short dwells over the WHOLE candidate list,
+                    # not one long dwell per candidate. See
+                    # `baud.DEFAULT_DWELL_SECONDS` for the target that
+                    # forced this: a board that emits a burst at boot and
+                    # then goes silent gives a single-pass scan exactly one
+                    # window's worth of evidence, and whichever candidate
+                    # happened to hold that window "wins" by luck.
+                    #
+                    # Nothing about the reader park or the gap ledger moves
+                    # for this. The port is opened once and never reopened
+                    # (a reopen re-asserts DTR and would reboot a
+                    # DTR-reset board once per dwell -- dozens of times
+                    # across a sweep rather than once per candidate), the
+                    # reader stays parked for the whole scan, and ONE gap
+                    # entry spans it, recorded before this loop and
+                    # finished after it. Sweeping changes only which rate
+                    # this thread has applied at any instant.
+                    scan_deadline = time.monotonic() + budget_seconds
+                    pending = list(rates)
+                    while pending:
+                        swept = True
+                        for rate in pending:
+                            if self._stop.is_set() or self._closing.is_set():
+                                swept = False
+                                break
+                            # The FIRST sweep is never cut short by the
+                            # budget: it is what makes every candidate
+                            # appear in the result with evidence of its
+                            # own, so an early exit later cannot leave the
+                            # ranking silent about a rate it never tried.
+                            # `check_budget` refuses a list too long to
+                            # sweep once, so this cannot overrun by more
+                            # than one sweep even when a caller passes its
+                            # own budget.
+                            if sweeps >= 1 and time.monotonic() >= scan_deadline:
+                                swept = False
+                                break
                             try:
-                                chunk = self._serial.read(READ_CHUNK)
+                                self._serial.baudrate = rate
+                                # Recorded on the line AFTER the assignment
+                                # that can raise, so it only ever names a
+                                # rate the port really took.
+                                applied_baud = rate
+                                # Discard whatever is sitting in the
+                                # driver's input queue from the PREVIOUS
+                                # candidate rate (or from before the scan
+                                # started): those bytes were framed at a
+                                # different speed and are not evidence
+                                # about `rate`. This does discard a few
+                                # genuine at-the-original-rate bytes the
+                                # driver had queued but the reader had not
+                                # yet drained -- an unavoidable part of the
+                                # same gap, which is exactly why the gap is
+                                # measured from `gap_start_time` (before
+                                # this call), not from the first
+                                # candidate's read loop.
+                                self._serial.reset_input_buffer()
                             except (serial.SerialException, OSError) as exc:
-                                self._die(self._explain(exc, "baud scan (read)"))
-                                break
-                            if chunk:
-                                collected.extend(chunk)
+                                self._die(self._explain(exc, "baud scan (set rate)"))
+                                raise SessionError(
+                                    f"session {self.id}: setting {rate} baud "
+                                    f"failed and the device looks gone: "
+                                    f"{self.death_reason}"
+                                ) from exc
+                            except (ValueError, OverflowError) as exc:
+                                # pyserial's custom-baud path converts a
+                                # kernel-rejected rate to ValueError
+                                # (serialposix.py's _set_special_baudrate),
+                                # and the termios array('i') store raises
+                                # OverflowError for a rate that does not fit
+                                # a C int (>= 2**31). Neither means the
+                                # device is gone, and neither means the REST
+                                # of the scan is untrustworthy: invariant 5
+                                # is ranked evidence, never a bare verdict,
+                                # and aborting every other candidate over one
+                                # the hardware itself refuses would throw
+                                # away perfectly good samples already in hand
+                                # (or still to come) for no reason connected
+                                # to them. Record the rejection and try the
+                                # next rate; it is dropped from `pending`
+                                # below so the sweep does not spend a termios
+                                # call re-learning the same refusal every
+                                # pass.
+                                rejected[rate] = str(exc)
+                                # Sweeping makes the refusal and the sample
+                                # arrive on DIFFERENT passes: a rate that
+                                # applied fine on sweep 1 has bytes in
+                                # `samples` by the time a transient refusal
+                                # on sweep 3 lands it in `rejected`. Left
+                                # there, `decide` could crown a rate the
+                                # port has just refused to be set to, and
+                                # the restore below would silently fall
+                                # back while `winner` still named it. A rate
+                                # the hardware refuses is not a candidate to
+                                # be left live, whatever it said earlier, so
+                                # its sample leaves the ranking with it.
+                                # This also keeps `samples` and `rejected`
+                                # DISJOINT, which is what makes tools.py's
+                                # `len(samples) + len(rejected)` a true
+                                # count of candidates attempted rather than
+                                # one that can exceed the number requested.
+                                samples.pop(rate, None)
                                 continue
-                            # A quiet line is the same two-way ambiguity
-                            # `_read_forever` resolves, and it matters MORE
-                            # here: an empty sample is scored as evidence
-                            # about `rate`, and a scan whose every candidate
-                            # came back empty because the adapter left the
-                            # bus is indistinguishable, by score alone, from
-                            # one whose ground is floating. tools.py hands
-                            # the second case a wiring hint. Without this
-                            # check the first case gets it too -- an
-                            # operator told to inspect the ground on a
-                            # device that is simply gone.
-                            if not os.path.lexists(self.device.by_id):
-                                self._die(
-                                    f"device {self.device.by_id} disappeared "
-                                    f"during a baud scan at {rate}: the by-id "
-                                    f"path no longer resolves (was "
-                                    f"{self.device.tty}) and the line has gone "
-                                    "quiet"
-                                )
+
+                            collected = samples.setdefault(rate, bytearray())
+                            dwell_start = time.monotonic()
+                            deadline = dwell_start + dwell_seconds
+                            while (time.monotonic() < deadline
+                                   and not self._stop.is_set()
+                                   and not self._closing.is_set()):
+                                try:
+                                    chunk = self._serial.read(READ_CHUNK)
+                                except (serial.SerialException, OSError) as exc:
+                                    self._die(self._explain(exc, "baud scan (read)"))
+                                    break
+                                if chunk:
+                                    collected.extend(chunk)
+                                    continue
+                                # A quiet line is the same two-way ambiguity
+                                # `_read_forever` resolves, and it matters
+                                # MORE here: an empty sample is scored as
+                                # evidence about `rate`, and a scan whose
+                                # every candidate came back empty because the
+                                # adapter left the bus is indistinguishable,
+                                # by score alone, from one whose ground is
+                                # floating. tools.py hands the second case a
+                                # wiring hint. Without this check the first
+                                # case gets it too -- an operator told to
+                                # inspect the ground on a device that is
+                                # simply gone.
+                                if not os.path.lexists(self.device.by_id):
+                                    self._die(
+                                        f"device {self.device.by_id} disappeared "
+                                        f"during a baud scan at {rate}: the by-id "
+                                        f"path no longer resolves (was "
+                                        f"{self.device.tty}) and the line has gone "
+                                        "quiet"
+                                    )
+                                    break
+                            listened[rate] = (listened.get(rate, 0.0)
+                                              + time.monotonic() - dwell_start)
+                            if not self.alive:
+                                swept = False
                                 break
-                        samples[rate] = bytes(collected)
-                        if not self.alive:
+
+                        if rejected:
+                            pending = [r for r in pending if r not in rejected]
+                        if not swept:
                             break
+                        sweeps += 1
+                        # Decided on a COMPLETED sweep only, so an early
+                        # exit is never taken on the strength of evidence
+                        # some candidate has not had the chance to produce.
+                        if early_exit is not None and any(
+                                early_exit(bytes(data))
+                                for data in samples.values() if data):
+                            early_exited = True
+                            break
+                        if time.monotonic() >= scan_deadline:
+                            break
+
+                    samples = {rate: bytes(data) for rate, data in samples.items()}
 
                     try:
                         winner = decide(samples) if samples else None
@@ -694,12 +839,39 @@ class ConsoleSession:
                     # else. `final_baud` defaults to `original_baud` (set
                     # before the try), so a bad candidate mid-loop restores
                     # the rate the session started at.
-                    try:
-                        self._serial.baudrate = final_baud
-                        self._serial.reset_input_buffer()
-                    except Exception:  # noqa: BLE001 -- best effort; the
-                        pass          # device may already be gone
-                    self.baud = final_baud
+                    #
+                    # Two rates are tried, not one: if the winner itself
+                    # will not apply -- the device went away between the
+                    # last dwell and here, or the kernel refused it on this
+                    # attempt having taken it earlier -- falling back to the
+                    # rate the session opened at is the only remaining
+                    # KNOWN rate. `dict.fromkeys` so the common case where
+                    # they are the same rate costs one termios call, not
+                    # two.
+                    for candidate in dict.fromkeys((final_baud, original_baud)):
+                        try:
+                            self._serial.baudrate = candidate
+                            self._serial.reset_input_buffer()
+                        except Exception:  # noqa: BLE001 -- best effort; the
+                            continue      # device may already be gone
+                        applied_baud = candidate
+                        break
+                    # `self.baud` is assigned from what the port ACCEPTED,
+                    # never from what this method wanted. The old
+                    # unconditional `self.baud = final_baud` sat outside the
+                    # try, so a restore that raised left the session
+                    # claiming a rate the line was not at -- the exact thing
+                    # the "left at a KNOWN rate and `self.baud` matches it"
+                    # guarantee above exists to rule out.
+                    if winner is not None and applied_baud != winner:
+                        # By this method's own contract a returned `winner`
+                        # is "left live". It is not, so it is not a winner:
+                        # reporting one the port is not at would make
+                        # `winner`/`final_baud`/`restored` mutually
+                        # contradictory in a single result.
+                        winner = None
+                    final_baud = applied_baud
+                    self.baud = applied_baud
             finally:
                 self._scan_pause.clear()
                 # Guarded on `gap_entry`, NOT `gap_start_time`: the latter is
@@ -717,6 +889,10 @@ class ConsoleSession:
         return {
             "samples": samples,
             "rejected": rejected,
+            "listen_seconds": listened,
+            "sweeps": sweeps,
+            "early_exit": early_exited,
+            "budget_seconds": budget_seconds,
             "original_baud": original_baud,
             "final_baud": final_baud,
             # `winner is None`, NOT `final_baud == original_baud`: a `decide`

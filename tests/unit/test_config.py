@@ -72,6 +72,45 @@ def test_a_non_positive_request_deadline_is_refused(monkeypatch):
         load_config()
 
 
+def test_scan_budget_defaults_to_the_baud_modules_budget(monkeypatch):
+    """Asserted as "the config default IS the module's", not as 12.0.
+
+    The number is calibration that lives in baud.py and is expected to move
+    with the bench; a copy of it typed here would only record when the two
+    last agreed.
+    """
+    from pare_hardware_mcp.baud import DEFAULT_SCAN_BUDGET_SECONDS
+    monkeypatch.delenv("PARE_HW_SCAN_BUDGET_S", raising=False)
+    assert load_config().scan_budget_s == DEFAULT_SCAN_BUDGET_SECONDS
+
+
+def test_scan_budget_is_read_from_the_environment(monkeypatch):
+    # The operator lever for a worker whose request deadline is below the
+    # default budget: without it that worker cannot scan at all, because the
+    # sweep's budget no longer shrinks when the caller passes fewer rates.
+    monkeypatch.setenv("PARE_HW_SCAN_BUDGET_S", "4.5")
+    assert load_config().scan_budget_s == 4.5
+
+
+def test_an_empty_scan_budget_env_var_is_treated_as_unset(monkeypatch):
+    from pare_hardware_mcp.baud import DEFAULT_SCAN_BUDGET_SECONDS
+    monkeypatch.setenv("PARE_HW_SCAN_BUDGET_S", "")
+    assert load_config().scan_budget_s == DEFAULT_SCAN_BUDGET_SECONDS
+
+
+def test_a_non_positive_scan_budget_is_refused(monkeypatch):
+    monkeypatch.setenv("PARE_HW_SCAN_BUDGET_S", "0")
+    with pytest.raises(ValueError):
+        load_config()
+
+
+def test_a_non_numeric_scan_budget_is_a_clear_error_not_a_crash(monkeypatch):
+    monkeypatch.setenv("PARE_HW_SCAN_BUDGET_S", "twelve")
+    with pytest.raises(ValueError) as e:
+        load_config()
+    assert "twelve" in str(e.value)
+
+
 def test_artifact_root_defaults_to_none_when_unset(monkeypatch):
     monkeypatch.delenv("PARE_HW_ARTIFACT_ROOT", raising=False)
     assert load_config().artifact_root is None
