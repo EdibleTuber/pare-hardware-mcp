@@ -45,7 +45,6 @@ import re
 from typing import Any
 
 from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_DWELL_SECONDS,
-                                    DEFAULT_SCAN_BUDGET_SECONDS,
                                     looks_like_console_bytes,
                                     GROUND_CROSSOVER_HINT, all_scored_poorly,
                                     all_silent, check_budget, pick_winner,
@@ -367,8 +366,16 @@ async def console_detect_baud(device: str | None = None,
 
     try:
         candidate_rates = sanitize_rates(rates)
+        # `CONFIG.scan_budget_s`, not the module constant: the budget no
+        # longer grows with the rate list, so an operator whose
+        # PARE_HW_REQUEST_DEADLINE_S is below the default budget has nothing
+        # they can pass to make a scan fit. PARE_HW_SCAN_BUDGET_S is that
+        # lever, and it is an operator's rather than the model caller's --
+        # see config.py for why. Read once here so the check and the scan
+        # below cannot disagree about the budget.
+        scan_budget = CONFIG.scan_budget_s
         check_budget(len(candidate_rates), DEFAULT_DWELL_SECONDS,
-                     DEFAULT_SCAN_BUDGET_SECONDS, CONFIG.request_deadline_s)
+                     scan_budget, CONFIG.request_deadline_s)
     except BaudScanError as exc:
         return _err(str(exc))
 
@@ -378,7 +385,7 @@ async def console_detect_baud(device: str | None = None,
         # for the whole scan.
         result = await asyncio.to_thread(
             sess.scan_baud, candidate_rates, DEFAULT_DWELL_SECONDS, pick_winner,
-            DEFAULT_SCAN_BUDGET_SECONDS, looks_like_console_bytes)
+            scan_budget, looks_like_console_bytes)
     except SessionError as exc:
         return _err(str(exc))
 
@@ -423,6 +430,12 @@ async def console_detect_baud(device: str | None = None,
         capture_gap=result["gap"],
     )
     requested = len(candidate_rates)
+    # A sum, not a union, because `scan_baud` keeps the two DISJOINT: a rate
+    # it records in `rejected` is dropped from `samples` even when an earlier
+    # sweep had already collected bytes at it. Without that, a sweeping scan
+    # could count one rate twice here and push `attempted` past `requested`,
+    # silently disarming the scan_aborted verdict below (which only fires on
+    # `attempted < requested`) for a scan that really was cut short.
     attempted = len(samples) + len(result["rejected"])
     # `death_reason` is the one liveness signal in this result that is NOT
     # racy, and it is why `alive` is still not consulted here. `_die` is the

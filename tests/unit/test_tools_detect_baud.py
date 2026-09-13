@@ -17,9 +17,11 @@ import json
 import pytest
 
 from pare_hardware_mcp import tools
-from pare_hardware_mcp.baud import (WINNER_CONSOLE_THRESHOLD,
+from pare_hardware_mcp.baud import (DEFAULT_DWELL_SECONDS,
+                                    WINNER_CONSOLE_THRESHOLD,
                                     WIRING_SUSPECT_CONSOLE_MAX,
                                     looks_like_console, score_sample)
+from pare_hardware_mcp.config import Config
 
 
 class FakeSession:
@@ -47,11 +49,20 @@ class FakeManager:
         self.current = current
 
 
-def install(monkeypatch, session=None, deadline=60.0):
+def install(monkeypatch, session=None, deadline=60.0, scan_budget=None):
+    """Install a fake session and a REAL `Config`.
+
+    The real dataclass rather than an ad-hoc stand-in: a hand-rolled fake
+    with only the attributes today's handler happens to read goes on passing
+    when the handler starts reading a new one, and the budget lever below is
+    exactly such a new one.
+    """
     manager = FakeManager(current=session)
     monkeypatch.setattr(tools, "MANAGER", manager)
-    monkeypatch.setattr(tools, "CONFIG",
-                        type("Cfg", (), {"request_deadline_s": deadline})())
+    kw = {"request_deadline_s": deadline}
+    if scan_budget is not None:
+        kw["scan_budget_s"] = scan_budget
+    monkeypatch.setattr(tools, "CONFIG", Config(**kw))
     return manager
 
 
@@ -121,13 +132,64 @@ async def test_a_dead_session_is_refused_before_scanning(monkeypatch):
 # Invariant 4: the budget is checked before the session is ever touched.
 # --------------------------------------------------------------------------
 
-async def test_a_rate_list_exceeding_the_deadline_is_refused_before_scanning(monkeypatch):
+async def test_a_budget_exceeding_the_deadline_is_refused_whatever_rates_are_passed(monkeypatch):
+    """The rate list stopped being a lever here, so the message must say so.
+
+    Under the single-pass scan the budget was `len(rates) * dwell`, so an
+    operator on a tight deadline could scan by passing one or two rates.
+    The sweep's budget is wall time and does not move with the list, which
+    makes this refusal unconditional -- and left a caller reading "exceeds
+    the deadline" with nothing it could do. Asserted as the RELATIONSHIP
+    that replaced the old one (one rate refuses exactly as eight does)
+    rather than against a particular list, and the message must name a lever
+    that actually exists.
+    """
     session = FakeSession()
     install(monkeypatch, session=session, deadline=1.0)
+    outs = [json.loads(await tools.console_detect_baud(rates=rates))
+            for rates in ([9600], [9600, 115200],
+                          [9600, 19200, 38400, 57600, 115200, 230400])]
+    for out in outs:
+        assert out["error"], "a budget over the deadline must refuse"
+        assert "deadline" in out["error"]
+        assert "PARE_HW_SCAN_BUDGET_S" in out["error"], (
+            "the refusal must name the lever that resolves it, or the "
+            f"operator has none: {out['error']}")
+    assert len({out["error"] for out in outs}) == 1, (
+        "the refusal must not depend on the rate list -- the budget does "
+        f"not: {[o['error'] for o in outs]}")
+    assert session.scan_calls == [], "the port must not be touched by a refused scan"
+
+
+async def test_an_operator_can_lower_the_budget_to_fit_a_tight_deadline(monkeypatch):
+    """The lever, exercised: the same deadline that refuses above scans here.
+
+    And the budget that passed the check is the budget the scan is given --
+    a check against one number and a scan against another would put the
+    overrun back exactly where invariant 4 says it must not be discovered.
+    """
+    session = FakeSession(scan_result=winner_result())
+    install(monkeypatch, session=session, deadline=1.0, scan_budget=0.8)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+    assert "error" not in out
+    (_rates, _dwell, budget, _early_exit), = session.scan_calls
+    assert budget == 0.8
+
+
+async def test_a_rate_list_too_long_to_sweep_once_is_refused_before_scanning(monkeypatch):
+    """The caller's half of invariant 4, and the one the rate list DOES move.
+
+    Sized from the constants rather than from a typed-in list, so it keeps
+    testing "one sweep does not fit" if the dwell changes.
+    """
+    budget = 1.0
+    too_many = int(budget / DEFAULT_DWELL_SECONDS) + 2
+    session = FakeSession()
+    install(monkeypatch, session=session, deadline=60.0, scan_budget=budget)
     out = json.loads(await tools.console_detect_baud(
-        rates=[9600, 19200, 38400, 57600, 115200, 230400, 460800, 921600]))
+        rates=[9600 * (i + 1) for i in range(too_many)]))
     assert out["error"]
-    assert "deadline" in out["error"]
+    assert "fewer rates" in out["error"]
     assert session.scan_calls == [], "the port must not be touched by a refused scan"
 
 
@@ -505,6 +567,57 @@ async def test_the_scans_own_capture_gap_is_reported(monkeypatch):
     # mismatch here would silently exercise the scan_aborted branch instead.
     out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
     assert out["capture_gap"] == GAP
+
+
+# --------------------------------------------------------------------------
+# How the budget was spent. A sweep does not sample every candidate equally,
+# and `sweeps`/`early_exit`/`listen_seconds` are the only things in the
+# response that say so -- without them a caller reads two candidates' scores
+# as if they rested on the same amount of evidence.
+# --------------------------------------------------------------------------
+
+async def test_how_the_budget_was_spent_reaches_the_wire(monkeypatch):
+    """The whole sweep-accounting surface, asserted as a relationship.
+
+    Deleting `sweeps=`/`early_exit=` from the response, or dropping
+    `listen_seconds` by calling `rank_candidates(samples)` with one
+    argument, passed the whole suite before this test existed -- the surface
+    was reported by nothing.
+
+    The bound is the one `scan_baud` guarantees (a candidate gets at least
+    one dwell per completed sweep), so it keeps meaning something if the
+    fixture's numbers change, and the unequal-sampling assertion is what the
+    fields exist FOR: two candidates, different evidence, visibly so.
+    """
+    result = winner_result()
+    result["sweeps"] = 4
+    result["early_exit"] = True
+    # 9600 was reached on every completed sweep; 115200 got the extra dwells
+    # of a partial final pass. Exactly the inequality the fields report.
+    result["listen_seconds"] = {9600: 4 * DEFAULT_DWELL_SECONDS,
+                                115200: 9 * DEFAULT_DWELL_SECONDS}
+    session = FakeSession(scan_result=result)
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud(rates=[9600, 115200]))
+
+    assert "sweeps" in out, "a caller cannot weigh the evidence without it"
+    assert "early_exit" in out, (
+        "whether the scan stopped on a winner or on the clock is not "
+        "recoverable from anything else in the response")
+    assert out["sweeps"] == result["sweeps"]
+    assert out["early_exit"] is True
+
+    listened = {c["rate"]: c["listen_seconds"] for c in out["candidates"]}
+    assert set(listened) == set(result["samples"]), (
+        "every ranked candidate must carry how long it was listened to: "
+        f"{listened}")
+    for rate, seconds in listened.items():
+        assert seconds >= out["sweeps"] * DEFAULT_DWELL_SECONDS, (
+            f"{rate} reports {seconds}s, less than the one dwell per "
+            f"completed sweep {out['sweeps']} sweeps guarantee")
+    assert len(set(listened.values())) > 1, (
+        "the candidates were sampled unequally and the response flattened "
+        f"that away: {listened}")
 
 
 async def test_a_session_error_from_the_scan_is_reported_not_raised(monkeypatch):

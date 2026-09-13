@@ -496,11 +496,27 @@ def check_budget(num_rates: int, dwell_seconds: float, budget_seconds: float,
        means the caller is told which of its rates would have gone unsampled
        BEFORE the port is touched, rather than reading a ranking that
        silently omitted them.
+
+    Each refusal names the lever that resolves it, because they are levers
+    held by DIFFERENT parties and the caller cannot tell which from the
+    numbers alone. (2) is the caller's: it passed the rates, so "pass fewer
+    rates" is advice it can act on. (1) is not -- the budget no longer grows
+    with the candidate count, so nothing the caller passes changes it, and
+    a message that only stated the arithmetic left an operator on a tight
+    deadline with a scan that could not be made to fit by any means. Both
+    of (1)'s knobs are environment variables an operator sets on the worker,
+    so the message names them rather than implying the caller retry.
     """
     if budget_seconds > deadline_s:
         raise BaudScanError(
             f"a baud scan needs {budget_seconds:.1f}s, which exceeds this "
-            f"worker's {deadline_s:.1f}s request deadline"
+            f"worker's {deadline_s:.1f}s request deadline. The rate list "
+            "does not affect this -- the budget is wall time the sweep "
+            "spends, not a per-candidate cost -- so passing fewer rates "
+            "will not help. An operator raises PARE_HW_REQUEST_DEADLINE_S, "
+            "or lowers PARE_HW_SCAN_BUDGET_S to knowingly accept a shorter "
+            "scan with fewer sweeps (and so a smaller chance of catching a "
+            "boot burst)"
         )
     one_sweep = num_rates * dwell_seconds
     if one_sweep > budget_seconds:

@@ -100,11 +100,16 @@ def test_the_default_ladder_does_not_refuse_its_own_scan():
 
     Two ways to break it, and this catches both: growing the ladder until one
     sweep no longer fits the budget, and raising the budget past the worker's
-    own request deadline. Uses `Config()`'s real default deadline rather than
-    a number typed here, so it tracks the worker rather than a copy of it.
+    own request deadline. Uses `Config()`'s real defaults rather than numbers
+    typed here, so it tracks the worker as SHIPPED -- the budget is now an
+    operator-overridable setting (PARE_HW_SCAN_BUDGET_S) whose default it
+    takes from this module, and it is the shipped pair that must not refuse
+    itself.
     """
+    cfg = Config()
     check_budget(len(DEFAULT_RATES), DEFAULT_DWELL_SECONDS,
-                 DEFAULT_SCAN_BUDGET_SECONDS, Config().request_deadline_s)
+                 cfg.scan_budget_s, cfg.request_deadline_s)
+    assert cfg.scan_budget_s == DEFAULT_SCAN_BUDGET_SECONDS
 
 
 # --------------------------------------------------------------------------
@@ -332,12 +337,19 @@ def test_the_simulator_reproduces_the_benchs_printable_ratio():
 def test_printable_ratio_alone_cannot_separate_garbage_from_console_text():
     """The defect, stated as a test: the OLD discriminator fails here.
 
-    Some misframed samples score above `WIRING_SUSPECT_PRINTABLE_MAX` (0.5,
-    the bar the old code used) and would therefore have been read as "a
-    worse rate, not a wiring problem", and some come within a few points of
-    `WINNER_PRINTABLE_THRESHOLD`. This test does not assert the fix -- it
-    pins the reason for it, so a future change that quietly reverts to
-    printable-only scoring has something to fail against.
+    Some misframed samples score above 0.5 -- a bare printable-ratio bar the
+    old wiring check used, which is gone along with the constant that named
+    it (`WIRING_SUSPECT_PRINTABLE_MAX`; `WIRING_SUSPECT_CONSOLE_MAX` replaced
+    it on the console-score axis, and is not the same number or the same
+    quantity). Those samples would have been read as "a worse rate, not a
+    wiring problem", and some come within a few points of
+    `WINNER_PRINTABLE_THRESHOLD`. The 0.5 below is therefore a HISTORICAL
+    literal, deliberately not resolved to a live constant: it records what
+    the deleted code did, and there is nothing in the module for it to track.
+
+    This test does not assert the fix -- it pins the reason for it, so a
+    future change that quietly reverts to printable-only scoring has
+    something to fail against.
     """
     ratios = [score_sample(d)["printable_ratio"] for _, _, d in MISFRAMED]
     assert max(ratios) > 0.5, (
