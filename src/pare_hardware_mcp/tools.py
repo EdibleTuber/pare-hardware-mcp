@@ -6,6 +6,34 @@ not text, and it reaches the model's context, the capture store, /snapshot and
 artifact design applies a control-character check to `path` and `drive_id` for
 exactly this reason; this is the same problem with far more volume. Encode here,
 strip at render time, and keep the capture byte-exact because it is evidence.
+
+NOTHING BLOCKING RUNS ON THE EVENT LOOP, AND NO HANDLER MAY ASSUME IT IS ALONE.
+The two are one rule, not two. `ConsoleSession.write` waits on `_write_lock`,
+which `scan_baud` holds for a whole scan and `_shutdown` holds for up to
+WRITE_DRAIN_TIMEOUT + JOIN_TIMEOUT; `SessionManager.close` waits on both.
+Called straight from an `async def`, either one stops every other tool call on
+this worker -- measured end-to-end over a pty: `console_send` blocked 3.78 s
+and a 50 ms status poller completed 0 of the ~75 polls due in that window.
+They run via `asyncio.to_thread`, and so does EVERY `MANAGER` call, as a flat
+rule rather than a per-call-site judgement. `SessionManager.open` holds the
+manager `_lock` across `resolve_device`, the `open(2)` on the tty, the 64 MiB
+buffer allocation and the reader thread's start (session.py:875-920) -- so
+once `console_open` itself is on a thread, any handler that touches `MANAGER`
+on the event loop can be parked on that lock for the whole of an open. `get`,
+`current` and `status` are each microseconds on their own; what makes them
+unsafe inline is who else holds the lock they take, and that is not a property
+any one call site can check. The cost is one thread hop per tool call against
+a call that arrived over a network.
+
+But the event loop was also the only thing keeping the handlers safe from each
+other. `console_read` reads `MANAGER.get(...)` and then `sess.buffer` with no
+await in between, and `ConsoleSession.buffer` raises `SessionError` once a
+close has discarded the capture. Moving the blocking calls to threads makes
+that interleaving reachable, so every handler catches what a CONCURRENT close
+can now make its session raise -- otherwise the {"error": ...} contract is
+escaped as an opaque transport failure exactly when the model most needs to
+read what happened. Both halves belong in the same change; neither is safe
+alone.
 """
 from __future__ import annotations
 
@@ -35,6 +63,15 @@ MANAGER = SessionManager(capacity=CONFIG.buffer_bytes)
 # Stripped here, at the point this worker reads it off disk, rather than
 # trusted through to the caller.
 _CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
+
+
+def _manager_current():
+    """`MANAGER.current` as a callable, so it can be handed to a thread.
+
+    Reads the module global at call time, which is what lets tests replace
+    `tools.MANAGER` and still exercise this path.
+    """
+    return MANAGER.current
 
 
 def _ok(**fields: Any) -> str:
@@ -77,10 +114,15 @@ async def console_read(session: str, cursor: int = 0,
     except ValueError as exc:
         return _err(str(exc))
     try:
-        sess = MANAGER.get(session)
+        sess = await asyncio.to_thread(MANAGER.get, session)
     except KeyError:
         return _err(f"no such session {session!r}")
     try:
+        # `sess.buffer` and `.read()` stay inline: the buffer's lock is a leaf
+        # held only for a memory copy of at most MAX_READ_LIMIT bytes by the
+        # one reader thread, which is microseconds (measured: 0.54 ms for the
+        # whole handler at the default limit, 1.40 ms at the ceiling --
+        # base64 included).
         data, next_cursor, dropped, remaining = sess.buffer.read(cursor, capped)
     except CursorError:
         # `cursor` is negative or ahead of `head`: not a position this API
@@ -88,6 +130,15 @@ async def console_read(session: str, cursor: int = 0,
         # case. Let it escape and it becomes an opaque transport-level
         # failure instead of something the model can read and correct.
         return _err(f"invalid cursor {cursor} for session {session!r}")
+    except SessionError as exc:
+        # A close landed between `MANAGER.get` returning this session and
+        # `sess.buffer` being read: `_shutdown` sets `_buffer = None`, and
+        # the property raises rather than hand back a capture belonging to a
+        # session that is over (session.py:186-193). There is no await
+        # between those two lines, so before console_close moved off the
+        # event loop this was unreachable -- and that is exactly why it has
+        # to be caught in the same change that makes it reachable.
+        return _err(str(exc))
     # `dropped` only ever counts bytes evicted by ring-buffer wraparound --
     # it cannot see a capture that was SUSPENDED (a baud scan pausing the
     # reader), because that leaves no byte range in cursor space at all,
@@ -109,12 +160,29 @@ async def console_read(session: str, cursor: int = 0,
 
 
 async def console_status() -> str:
-    return _ok(**MANAGER.status())
+    """Session state. Off the loop for the manager lock -- see the module note."""
+    return _ok(**await asyncio.to_thread(MANAGER.status))
 
 
 async def console_close(session: str) -> str:
+    """Release the port and end the session.
+
+    Off the event loop: `SessionManager.close` runs `_shutdown`, which joins
+    the reader (up to JOIN_TIMEOUT = 2.0s) and then waits on `_write_lock`
+    (up to WRITE_DRAIN_TIMEOUT = 6.0s) because the fd must not be closed
+    under an in-flight write. Run inline, that is up to 8 seconds in which
+    console_status and console_read cannot answer.
+
+    `KeyError` stays the only thing caught, and that is a claim about
+    `_shutdown`'s surface rather than an oversight: every fallible call in it
+    is individually wrapped -- `cancel_read`/`cancel_write` at
+    session.py:714-718, `_serial.close()` at :782-785 -- and the joins and
+    timed acquires do not raise. A second close of the same session takes
+    the `KeyError` path, because the slot is cleared under the manager lock
+    before the shutdown begins.
+    """
     try:
-        MANAGER.close(session)
+        await asyncio.to_thread(MANAGER.close, session)
     except KeyError:
         return _err(f"no such session {session!r}")
     return _ok(closed=session)
@@ -140,8 +208,16 @@ async def console_open(device: str | None = None, baud: int = 115200,
             "must configure a default by-id device path for this worker"
         )
     try:
-        sess = MANAGER.open(device=device, expect_serial=CONFIG.expect_serial,
-                            baud=baud, flow=flow, dtr=dtr, rts=rts)
+        # Off the event loop as well: this allocates the 64 MiB capture
+        # buffer, opens a tty (an `open(2)` on a wedged USB node is not
+        # instant), starts the reader thread, and can queue on the manager
+        # lock behind another open. The broad except is unchanged -- it
+        # already covered DeviceError, SessionError and anything pyserial
+        # raises, and `to_thread` re-raises in this frame, so nothing about
+        # which exceptions reach it changes.
+        sess = await asyncio.to_thread(
+            MANAGER.open, device=device, expect_serial=CONFIG.expect_serial,
+            baud=baud, flow=flow, dtr=dtr, rts=rts)
     except Exception as exc:                      # noqa: BLE001 - surface it
         return _err(str(exc))
     # Report the lines we asserted -- and, for rts, what the session actually
@@ -164,14 +240,30 @@ async def console_send(session: str, data_b64: str) -> str:
     except Exception:                             # noqa: BLE001
         return _err("data_b64 is not valid base64")
     try:
-        sess = MANAGER.get(session)
+        sess = await asyncio.to_thread(MANAGER.get, session)
     except KeyError:
         return _err(f"no such session {session!r}")
     if not sess.alive:
         return _err(f"session {session!r} is not alive: "
                     f"{getattr(sess, 'death_reason', 'unknown')}")
     try:
-        sess.write(payload)
+        # Off the event loop. `write` waits on `_write_lock`, which
+        # `scan_baud` holds for an entire scan and `_shutdown` holds while it
+        # drains -- and the wait is unbounded, since `write` acquires without
+        # a timeout (session.py:369). Measured over a pty through this
+        # handler: 3.78s blocked, and a 50 ms status poller completed 0 of
+        # the ~75 polls due in that window. Task 7 made this move for the
+        # scan and said it was "so a concurrent low-tier call (status, a
+        # read) is not starved for the whole scan" -- true of the scan, and
+        # false of the worker while the two calls that WAIT ON THE SCAN were
+        # still inline.
+        #
+        # The liveness checks above are not re-done here on purpose:
+        # `write` re-checks `_closed`/`_closing`/`alive` INSIDE `_write_lock`
+        # (session.py:370-379), which is the only place the check is not
+        # check-then-act. This handler's check is an early refusal, not the
+        # guard.
+        await asyncio.to_thread(sess.write, payload)
     except SessionError as exc:
         # Covers both a bounded write timeout (recoverable; the session stays
         # open) and a short write aborted by a concurrent close (the message
@@ -199,7 +291,7 @@ async def console_detect_baud(device: str | None = None,
     session's rate is RESTORED to what it was: leaving a board at a rate that
     produced garbage is worse than leaving it where it started.
     """
-    sess = MANAGER.current
+    sess = await asyncio.to_thread(_manager_current)
     if sess is None:
         return _err(
             "no console session is open; call console_open first. "
@@ -375,8 +467,15 @@ def _device_summary(device) -> dict[str, Any]:
 
 
 async def list_devices() -> str:
-    """List serial adapters present. Never reports voltage -- see module note."""
-    return _ok(devices=[_device_summary(d) for d in list_serial_devices()])
+    """List serial adapters present. Never reports voltage -- see module note.
+
+    The scan is a `listdir` plus a `realpath` per entry on `/dev/serial/by-id`.
+    Cheap, but they are blocking syscalls against a bus whose adapters can be
+    half-unplugged, so they go to a thread like every other syscall here
+    rather than being the one exception nobody revisits.
+    """
+    devices = await asyncio.to_thread(list_serial_devices)
+    return _ok(devices=[_device_summary(d) for d in devices])
 
 
 def _artifact_root_status(root: str | None) -> dict[str, Any]:
@@ -428,10 +527,23 @@ async def bench_status() -> str:
     is read-only, matching this tool's low tier.
     """
     cfg = load_config()
-    session_status = MANAGER.status()
+    # `_artifact_root_status` stats and reads a file under an operator-declared
+    # root -- in practice a removable drive on the bench. A `stat` on a wedged
+    # or disconnected USB filesystem blocks in the kernel for as long as it
+    # takes, and this is the tool an operator reaches for precisely when the
+    # bench is misbehaving; it must not be able to take the worker's event
+    # loop with it. `MANAGER.status()` goes with them: it takes the manager
+    # lock, and `SessionManager.open` holds that lock for the whole of a port
+    # open (session.py:875-920) -- which is itself on a thread now, so this
+    # one can genuinely queue behind it.
+    devices, artifact_root, session_status = await asyncio.gather(
+        asyncio.to_thread(list_serial_devices),
+        asyncio.to_thread(_artifact_root_status, cfg.artifact_root),
+        asyncio.to_thread(MANAGER.status),
+    )
     return _ok(
-        devices=[_device_summary(d) for d in list_serial_devices()],
-        artifact_root=_artifact_root_status(cfg.artifact_root),
+        devices=[_device_summary(d) for d in devices],
+        artifact_root=artifact_root,
         session={
             "open": session_status["open"],
             "session": session_status["session"],

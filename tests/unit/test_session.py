@@ -1809,6 +1809,74 @@ def test_a_concurrent_write_waits_for_the_scan_rather_than_racing_it(manager, pt
     writer.join(DEADLINE)
 
 
+def test_a_send_waiting_on_the_scan_lock_does_not_stall_other_tool_calls(manager, pty, monkeypatch):
+    """The whole-worker version of the starvation fix, over the real lock.
+
+    Task 7 moved `scan_baud` off the event loop "so a concurrent low-tier
+    call (status, a read) is not starved for the whole scan". That is true of
+    the scan and was false of the worker: `console_send` waits on the same
+    `_write_lock` the scan holds, and `console_send` was inline, so the
+    starvation simply moved to whoever called it. Measured through the real
+    handlers over this pty before the fix: 3.78s blocked, 0 of the ~75 status
+    polls due in that window completed.
+
+    This test lives in test_session.py rather than with the other tools tests
+    because it needs the pty fixtures and a real `SessionManager` -- the fake
+    in test_tools_concurrency.py pins the same property deterministically,
+    while this one pins it against the actual lock the scan holds.
+
+    Would catch `sess.write(payload)` being re-inlined in tools.py: the probe
+    gets no control for the whole wait and ticks zero times.
+    """
+    import asyncio
+    import base64
+    import json
+
+    from pare_hardware_mcp import tools
+
+    monkeypatch.setattr(tools, "MANAGER", manager)
+    session = open_ok(manager, pty, baud=9600)
+
+    scan = threading.Thread(
+        target=lambda: session.scan_baud((9600, 115200, 230400), 0.5,
+                                         no_op_decide),
+        daemon=True)
+    scan.start()
+    until(lambda: session._scan_parked.is_set(),
+          what="the scan to take _write_lock and park the reader")
+
+    async def drive():
+        done = asyncio.Event()
+        ticks = {"n": 0}
+
+        async def probe():
+            while not done.is_set():
+                # A real low-tier tool call, not a bare sleep: the claim is
+                # that console_status still ANSWERS during the wait.
+                json.loads(await tools.console_status())
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        task = asyncio.create_task(probe())
+        try:
+            raw = await tools.console_send(
+                session=session.id,
+                data_b64=base64.b64encode(b"reboot\r").decode())
+        finally:
+            done.set()
+            await task
+        return json.loads(raw), ticks["n"]
+
+    out, ticks = asyncio.run(drive())
+    scan.join(timeout=DEADLINE)
+
+    assert out.get("sent") == 7, out
+    # The send genuinely waits for the scan -- that is the design, and it is
+    # not what this test objects to. What it pins is that everything else
+    # kept answering while it waited.
+    assert ticks >= 10, f"console_status was starved during the send: {ticks}"
+
+
 def test_close_during_a_scan_aborts_it_promptly_rather_than_hanging(manager, pty):
     session = open_ok(manager, pty)
     scan_returned = threading.Event()
