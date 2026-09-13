@@ -1,0 +1,39 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # Matches requires-python = ">=3.12" and the sibling workers.
+        python-version: ["3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+      - name: Run tests
+        run: pytest -v
+      - name: The contract must import with no hardware and no pyserial
+        # PARE's CI imports this module on a runner to validate risk pins. If it
+        # ever needs a device, that check degrades to a silent skip.
+        run: |
+          python - <<'CHECK'
+          import subprocess, sys
+          code = ("import sys; sys.modules['serial'] = None;"
+                  "import pare_hardware_mcp.contract as c; print(len(c.TOOL_SPECS))")
+          r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+          if r.returncode != 0:
+              sys.exit("contract.py cannot be imported without pyserial:\n" + r.stderr)
+          print("contract imports clean:", r.stdout.strip(), "tools")
+          CHECK

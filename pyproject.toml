@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pare-hardware-mcp"
+version = "0.1.0"
+description = "Hardware-bench MCP worker for PARE (Tigard UART console)"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=1.27.0,<2",   # 2.0 renamed streamablehttp_client; agent_core targets 1.x
+    "pare-worker-kit @ git+https://github.com/EdibleTuber/pare-worker-kit.git@v0.1.2",
+    "pyserial>=3.5",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio"]
+
+[project.scripts]
+pare-hardware-mcp = "pare_hardware_mcp.server:main"
+
+[tool.hatch.metadata]
+# Required for the pare-worker-kit git dependency. Without it hatchling refuses
+# ANY direct URL reference -- a hard metadata-generation failure, not a warning.
+allow-direct-references = true
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pare_hardware_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
