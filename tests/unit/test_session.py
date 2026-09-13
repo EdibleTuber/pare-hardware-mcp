@@ -1206,3 +1206,222 @@ def test_write_puts_bytes_on_the_line(manager, pty):
         return b"help\r" in bytes(received)
 
     until(arrived, what="the target to receive the write")
+
+
+# --------------------------------------------------------------------------
+# scan_baud -- Task 7. A pty has no real UART framing, so these tests cannot
+# prove a candidate rate is physically wrong; they prove the COORDINATION
+# invariants: the reader is never racing the scan for bytes, a scan sample
+# never reaches the capture buffer, the port is reconfigured rather than
+# reopened, nothing is ever transmitted, and close()/write() still behave
+# correctly around a scan in flight.
+# --------------------------------------------------------------------------
+
+def no_op_decide(samples):
+    return None
+
+
+def test_scan_baud_rejects_a_zero_rate_before_touching_the_port(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    with pytest.raises(SessionError) as e:
+        session.scan_baud((9600, 0, 115200), 0.1, no_op_decide)
+    assert "0" in str(e.value)
+
+    # Nothing was touched: still capturing at the original rate.
+    assert session.baud == 9600
+    assert session._serial.baudrate == 9600
+    pty.send(b"still alive\r\n")
+    until(lambda: b"still alive" in session.buffer.read(0)[0],
+          what="capture unaffected by the refused scan")
+
+
+def test_scan_baud_rejects_a_negative_or_non_integer_rate(manager, pty):
+    session = open_ok(manager, pty)
+    for bad_rates in ((9600, -1), (9600, True), (9600, 3.5)):
+        with pytest.raises(SessionError):
+            session.scan_baud(bad_rates, 0.1, no_op_decide)
+
+
+def test_scan_baud_rejects_an_empty_rate_list(manager, pty):
+    session = open_ok(manager, pty)
+    with pytest.raises(SessionError):
+        session.scan_baud((), 0.1, no_op_decide)
+
+
+def test_scan_baud_refuses_on_a_dead_session(manager, pty):
+    session = open_ok(manager, pty)
+    pty.unplug_far_end()
+    until(lambda: not session.alive, what="death")
+    with pytest.raises(SessionError):
+        session.scan_baud((9600, 115200), 0.1, no_op_decide)
+
+
+def test_scan_baud_never_writes_to_the_target(manager, pty):
+    """Invariant 3: detection never transmits."""
+    session = open_ok(manager, pty)
+    real_write = session._serial.write
+    calls = []
+
+    def spy(data):
+        calls.append(bytes(data))
+        return real_write(data)
+
+    session._serial.write = spy
+    session.scan_baud((9600, 115200, 230400), 0.15, no_op_decide)
+    assert calls == [], f"scan_baud transmitted: {calls!r}"
+
+
+def test_scan_baud_never_closes_and_reopens_the_port(manager, pty):
+    """Invariant 1: change speed via termios on the held fd, never reopen."""
+    session = open_ok(manager, pty)
+    serial_obj = session._serial
+    fd_before = serial_obj.fileno()
+
+    session.scan_baud((9600, 115200, 230400), 0.1, lambda s: 115200)
+
+    assert session._serial is serial_obj, "the port object was replaced"
+    assert session._serial.is_open
+    assert session._serial.fileno() == fd_before, "the fd changed -- a reopen happened"
+
+
+def test_scan_baud_leaves_the_port_at_the_decided_winner(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud((9600, 115200, 230400), 0.1, lambda s: 115200)
+
+    assert result["final_baud"] == 115200
+    assert result["original_baud"] == 9600
+    assert result["restored"] is False
+    assert session.baud == 115200
+    assert session._serial.baudrate == 115200
+
+
+def test_scan_baud_reports_a_winner_that_matches_the_original_rate_as_a_win(manager, pty):
+    """`restored` must mean 'no winner was found', not 'the rate is unchanged'.
+
+    A `decide` that correctly confirms the session's current rate is a real
+    winner -- conflating it with the fallback-restore case would tell a
+    caller the scan found nothing when it actually confirmed the rate.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud((9600, 115200), 0.1, lambda s: 9600)
+
+    assert result["winner"] == 9600
+    assert result["final_baud"] == 9600
+    assert result["restored"] is False
+
+
+def test_scan_baud_restores_the_original_rate_when_there_is_no_winner(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud((9600, 115200), 0.1, no_op_decide)
+
+    assert result["final_baud"] == 9600
+    assert result["restored"] is True
+    assert session.baud == 9600
+    assert session._serial.baudrate == 9600
+
+
+def test_scan_baud_samples_never_reach_the_capture_buffer(manager, pty):
+    """The invariant the whole coordination design exists for.
+
+    A byte sent while the scan is paused-and-sampling must show up in the
+    scan's OWN samples, never in the session's continuous capture -- even
+    though on a pty it is trivially "readable" at every rate, since a pty has
+    no real UART framing to make a wrong rate produce garbage.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    assert session.buffer.head == 0
+
+    def send_during_scan():
+        until(lambda: session._scan_parked.is_set(),
+              what="the reader to park for the scan")
+        pty.send(b"scanned bytes\r\n")
+
+    sender = threading.Thread(target=send_during_scan, daemon=True)
+    sender.start()
+
+    result = session.scan_baud((9600, 115200), 0.3, no_op_decide)
+    sender.join(DEADLINE)
+
+    assert session.buffer.head == 0, (
+        "bytes sent while the scan held the port reached the capture buffer "
+        "-- a scan sample would be indistinguishable from real target output"
+    )
+    all_sampled = b"".join(result["samples"].values())
+    assert b"scanned bytes" in all_sampled
+
+
+def test_reader_resumes_capturing_after_the_scan_ends(manager, pty):
+    session = open_ok(manager, pty)
+    session.scan_baud((9600, 115200), 0.1, no_op_decide)
+
+    pty.send(b"post-scan capture\r\n")
+    until(lambda: b"post-scan capture" in session.buffer.read(0)[0],
+          what="the reader to resume once the scan hands the port back")
+
+
+def test_reader_resumes_at_the_winning_rate_after_the_scan_ends(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    session.scan_baud((9600, 115200), 0.1, lambda s: 115200)
+    assert session._serial.baudrate == 115200
+
+    pty.send(b"post-scan at new rate\r\n")
+    until(lambda: b"post-scan at new rate" in session.buffer.read(0)[0],
+          what="the reader to keep capturing at the rate the scan left it on")
+
+
+def test_a_concurrent_write_waits_for_the_scan_rather_than_racing_it(manager, pty):
+    """Holding `_write_lock` for the whole scan, not just the reconfiguration,
+    is what stops a wrong-rate write from reaching the target mid-scan."""
+    session = open_ok(manager, pty)
+    scan_done = threading.Event()
+    write_saw_scan_done = []
+    write_finished = threading.Event()
+
+    def run_scan():
+        session.scan_baud((9600, 115200, 230400), 0.2, no_op_decide)
+        scan_done.set()
+
+    def run_write():
+        session.write(b"x")
+        write_saw_scan_done.append(scan_done.is_set())
+        write_finished.set()
+
+    scanner = threading.Thread(target=run_scan, daemon=True)
+    scanner.start()
+    until(lambda: session._scan_parked.is_set(), what="the scan to start")
+
+    writer = threading.Thread(target=run_write, daemon=True)
+    writer.start()
+    assert write_finished.wait(DEADLINE)
+    assert write_saw_scan_done == [True], \
+        "the write proceeded while the scan still held the port"
+
+    scanner.join(DEADLINE)
+    writer.join(DEADLINE)
+
+
+def test_close_during_a_scan_aborts_it_promptly_rather_than_hanging(manager, pty):
+    session = open_ok(manager, pty)
+    scan_returned = threading.Event()
+
+    def run_scan():
+        try:
+            session.scan_baud((9600, 115200, 230400, 460800), 3.0, no_op_decide)
+        except SessionError:
+            pass
+        finally:
+            scan_returned.set()
+
+    scanner = threading.Thread(target=run_scan, daemon=True)
+    scanner.start()
+    until(lambda: session._scan_parked.is_set(), what="the scan to start")
+
+    started = time.monotonic()
+    manager.close(session.id)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < WRITE_DRAIN_TIMEOUT, \
+        f"close took {elapsed:.2f}s waiting on a scan that should abort promptly"
+    assert scan_returned.wait(DEADLINE)
+    scanner.join(DEADLINE)
+    assert manager.current is None

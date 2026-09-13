@@ -9,10 +9,15 @@ strip at render time, and keep the capture byte-exact because it is evidence.
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from typing import Any
 
+from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_SAMPLE_SECONDS,
+                                    GROUND_CROSSOVER_HINT, all_silent,
+                                    check_budget, pick_winner,
+                                    rank_candidates, sanitize_rates)
 from pare_hardware_mcp.config import load_config
 from pare_hardware_mcp.ringbuffer import CursorError
 from pare_hardware_mcp.session import SessionError, SessionManager
@@ -122,3 +127,87 @@ async def console_send(session: str, data_b64: str) -> str:
         # never be reported here: the write did not demonstrably complete.
         return _err(str(exc))
     return _ok(session=session, sent=len(payload))
+
+
+async def console_detect_baud(device: str | None = None,
+                              rates: list[int] | None = None) -> str:
+    """Sample the open session's line at each candidate rate. Never opens a port.
+
+    RULING: `contract.py`'s `device` argument implies opening a port of its
+    own, which collides with the one-exclusive-session rule and with never
+    closing/reopening between candidates (a reopen re-asserts DTR). This
+    requires an already-open session and scans on ITS held descriptor;
+    `device`, if given, is only checked against that session's device for the
+    caller's own sanity, never used to open anything.
+
+    On a clear winner the session is LEFT at that rate -- no second open, so
+    no second DTR assertion at the target. When nothing scores well, the
+    session's rate is RESTORED to what it was: leaving a board at a rate that
+    produced garbage is worse than leaving it where it started.
+    """
+    sess = MANAGER.current
+    if sess is None:
+        return _err(
+            "no console session is open; call console_open first. "
+            "console_detect_baud scans the open session's held descriptor "
+            "and never opens a port of its own -- opening its own port would "
+            "collide with the one-exclusive-session rule and would mean "
+            "reopening (and re-asserting DTR) between candidates"
+        )
+    if device is not None and device != sess.device.by_id:
+        return _err(
+            f"session {sess.id} is open on {sess.device.by_id!r}, not "
+            f"{device!r}. console_detect_baud scans the open session's port "
+            "and does not open a different device -- close the current "
+            "session first if you meant to scan a different one"
+        )
+    if not sess.alive:
+        return _err(f"session {sess.id} is not alive, refusing to scan: "
+                    f"{sess.death_reason}")
+
+    try:
+        candidate_rates = sanitize_rates(rates)
+        check_budget(len(candidate_rates), DEFAULT_SAMPLE_SECONDS,
+                     CONFIG.request_deadline_s)
+    except BaudScanError as exc:
+        return _err(str(exc))
+
+    try:
+        # The longest call in the worker: run the blocking scan off the event
+        # loop so a concurrent low-tier call (status, a read) is not starved
+        # for the whole scan.
+        result = await asyncio.to_thread(
+            sess.scan_baud, candidate_rates, DEFAULT_SAMPLE_SECONDS, pick_winner)
+    except SessionError as exc:
+        return _err(str(exc))
+
+    samples = result["samples"]
+    candidates = rank_candidates(samples)
+    for candidate in candidates:
+        candidate["sample_b64"] = base64.b64encode(candidate.pop("sample")).decode("ascii")
+
+    response = dict(
+        session=sess.id,
+        original_baud=result["original_baud"],
+        final_baud=result["final_baud"],
+        restored=result["restored"],
+        alive=result["alive"],
+        death_reason=result["death_reason"],
+        candidates=candidates,
+    )
+    if all_silent(samples):
+        response["verdict"] = "no_data_at_any_rate"
+        response["hint"] = GROUND_CROSSOVER_HINT
+    elif result["restored"]:
+        response["verdict"] = "no_clear_winner"
+        response["note"] = (
+            "no candidate rate looked like clean console text; the session "
+            f"was left at its original baud ({result['original_baud']})"
+        )
+    else:
+        response["verdict"] = "winner"
+        response["note"] = (
+            f"left the session at {result['final_baud']} baud -- no second "
+            "open, and therefore no second DTR assertion at the target"
+        )
+    return _ok(**response)

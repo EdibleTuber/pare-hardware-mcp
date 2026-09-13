@@ -80,6 +80,13 @@ JOIN_TIMEOUT = 2.0
 # this bound should not be reachable.
 WRITE_DRAIN_TIMEOUT = 6.0
 
+# How long `scan_baud` waits for the reader thread to park (stop calling
+# `port.read()`) before giving up on the scan. A reader loop iteration is
+# bounded by READ_TIMEOUT, so this is generous slack, not a tight fit --
+# exceeding it means the reader is wedged somewhere it should not be, and the
+# scan refuses rather than risk two readers on the same fd.
+SCAN_PARK_TIMEOUT = 1.0
+
 FLOW_MODES = ("none", "rtscts", "xonxoff")
 
 
@@ -141,6 +148,13 @@ class ConsoleSession:
         # by N * write_timeout and the drain bound means nothing.
         self._closing = threading.Event()
         self._stop = threading.Event()
+        # `scan_baud` sets `_scan_pause` to ask the reader to stop calling
+        # `port.read()` -- two readers on one fd would race for bytes -- and
+        # waits for `_scan_parked` before it touches the port itself, so the
+        # scan is provably the only thing reading while it changes the line
+        # speed underneath what would otherwise be a live capture.
+        self._scan_pause = threading.Event()
+        self._scan_parked = threading.Event()
         self._reader = threading.Thread(
             target=self._read_forever,
             name=f"console-reader-{session_id}",
@@ -220,6 +234,20 @@ class ConsoleSession:
         assert buffer is not None
         port = self._serial
         while not self._stop.is_set():
+            if self._scan_pause.is_set():
+                # A baud scan owns the port: step aside so it is the only
+                # thing calling port.read() while it changes line speed, and
+                # touch neither the port nor the buffer until it hands the
+                # port back. Appending here would risk two readers racing for
+                # bytes on one fd, and -- the harm that actually matters --
+                # could land a sample taken at a candidate rate the target
+                # was never using into the capture, as if the target had said
+                # it at the session's real rate.
+                self._scan_parked.set()
+                while self._scan_pause.is_set() and not self._stop.is_set():
+                    time.sleep(0.01)
+                self._scan_parked.clear()
+                continue
             try:
                 data = port.read(READ_CHUNK)
             except (serial.SerialException, OSError) as exc:
@@ -330,6 +358,137 @@ class ConsoleSession:
                     "command did not take effect, and do not resume from this "
                     "offset."
                 )
+
+    def scan_baud(self, rates: tuple[int, ...], sample_seconds: float,
+                  decide) -> dict:
+        """Sample the line at each rate in `rates`, on THIS descriptor, without
+        transmitting -- then leave the port at whatever `decide` picks.
+
+        Never closes and reopens: reopening re-asserts DTR, which would
+        reboot a DTR-reset board once per candidate and never let it stay up
+        long enough to emit a clean sample. Instead this changes `baudrate`
+        via termios on the already-open fd between candidates.
+
+        `decide(samples: dict[rate, bytes]) -> int | None` is called exactly
+        once, with every candidate's raw bytes, after the last one is
+        sampled and before the port is touched again -- so the decision is
+        applied atomically with the rest of the scan, and the reader thread
+        (paused for the whole call, see `_read_forever`) never observes an
+        intermediate rate. Returning `None` restores the rate the session was
+        on when the scan started; a returned rate is left live.
+
+        Holds `_write_lock` for the ENTIRE scan, not just the port
+        reconfiguration: `write()` takes the same lock, so a concurrent
+        `console_send` blocks rather than putting bytes on the wire while the
+        rate is in flux -- a wrong-rate write is framing garbage arriving at
+        whatever the target's bootloader is, exactly the hazard "detection
+        never transmits" exists to avoid. A `close()` racing this still
+        completes: `_stop`/`_closing` are checked between candidates and
+        inside each candidate's read loop, and `_shutdown`'s `cancel_read()`
+        interrupts whichever read is in flight, so the scan aborts and
+        releases `_write_lock` well inside `_shutdown`'s own drain timeout.
+
+        Raises `SessionError` for a bad rate list, a session that is not
+        alive, or a reader that will not park -- always BEFORE the port is
+        touched.
+        """
+        if not rates:
+            raise SessionError("scan_baud: no candidate rates given")
+        if any((not isinstance(r, int)) or isinstance(r, bool) or r <= 0
+               for r in rates):
+            raise SessionError(
+                f"scan_baud: refusing rate list {rates!r} -- every rate must "
+                "be a positive integer; 0 deasserts the modem control lines"
+            )
+
+        acquired = self._write_lock.acquire(timeout=WRITE_DRAIN_TIMEOUT)
+        if not acquired:
+            raise SessionError(
+                f"session {self.id}: could not get exclusive access to the "
+                f"port within {WRITE_DRAIN_TIMEOUT}s (a write is in flight); "
+                "refusing to scan rather than contend with it"
+            )
+        try:
+            if self._closed or self._closing.is_set():
+                raise SessionError(
+                    f"session {self.id} is closing or closed; refusing to scan"
+                )
+            if not self.alive:
+                raise SessionError(
+                    f"session {self.id} is not alive, refusing to scan: "
+                    f"{self.death_reason}"
+                )
+
+            original_baud = self.baud
+            samples: dict[int, bytes] = {}
+
+            self._scan_pause.set()
+            try:
+                parked = self._scan_parked.wait(timeout=SCAN_PARK_TIMEOUT)
+                if not parked:
+                    raise SessionError(
+                        f"session {self.id}: reader thread did not park "
+                        f"within {SCAN_PARK_TIMEOUT}s; refusing to scan "
+                        "rather than risk two readers on one port"
+                    )
+
+                for rate in rates:
+                    if self._stop.is_set() or self._closing.is_set():
+                        break
+                    try:
+                        self._serial.baudrate = rate
+                        # Discard whatever is sitting in the driver's input
+                        # queue from the PREVIOUS candidate rate (or from
+                        # before the scan started): those bytes were framed
+                        # at a different speed and are not evidence about
+                        # `rate`.
+                        self._serial.reset_input_buffer()
+                    except (serial.SerialException, OSError) as exc:
+                        self._die(self._explain(exc, "baud scan (set rate)"))
+                        break
+
+                    collected = bytearray()
+                    deadline = time.monotonic() + sample_seconds
+                    while (time.monotonic() < deadline
+                           and not self._stop.is_set()
+                           and not self._closing.is_set()):
+                        try:
+                            chunk = self._serial.read(READ_CHUNK)
+                        except (serial.SerialException, OSError) as exc:
+                            self._die(self._explain(exc, "baud scan (read)"))
+                            break
+                        if chunk:
+                            collected.extend(chunk)
+                    samples[rate] = bytes(collected)
+                    if not self.alive:
+                        break
+
+                winner = decide(samples) if samples else None
+                final_baud = winner if winner is not None else original_baud
+                try:
+                    self._serial.baudrate = final_baud
+                    self._serial.reset_input_buffer()
+                except (serial.SerialException, OSError):
+                    pass  # the device is already gone; nothing more to do
+                self.baud = final_baud
+            finally:
+                self._scan_pause.clear()
+        finally:
+            self._write_lock.release()
+
+        return {
+            "samples": samples,
+            "original_baud": original_baud,
+            "final_baud": final_baud,
+            # `winner is None`, NOT `final_baud == original_baud`: a `decide`
+            # that correctly picks the rate the session was already on is a
+            # real winner, not a fallback restore, even though the two are
+            # indistinguishable by rate alone.
+            "winner": winner,
+            "restored": winner is None,
+            "alive": self.alive,
+            "death_reason": self.death_reason,
+        }
 
     def _shutdown(self) -> str | None:
         """Stop the reader, release the port, discard the capture.

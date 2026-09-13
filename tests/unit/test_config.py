@@ -1,6 +1,8 @@
 # tests/unit/test_config.py
 from __future__ import annotations
 
+import pytest
+
 from pare_hardware_mcp.config import Config, load_config
 
 
@@ -40,3 +42,31 @@ def test_config_is_frozen():
         pass
     else:
         raise AssertionError("Config must be immutable")
+
+
+def test_request_deadline_defaults_to_sixty_seconds(monkeypatch):
+    monkeypatch.delenv("PARE_HW_REQUEST_DEADLINE_S", raising=False)
+    assert load_config().request_deadline_s == 60.0
+
+
+def test_request_deadline_is_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv("PARE_HW_REQUEST_DEADLINE_S", "12.5")
+    assert load_config().request_deadline_s == 12.5
+
+
+def test_an_empty_request_deadline_env_var_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("PARE_HW_REQUEST_DEADLINE_S", "")
+    assert load_config().request_deadline_s == 60.0
+
+
+def test_a_non_numeric_request_deadline_is_a_clear_error_not_a_crash(monkeypatch):
+    monkeypatch.setenv("PARE_HW_REQUEST_DEADLINE_S", "soon")
+    with pytest.raises(ValueError) as e:
+        load_config()
+    assert "soon" in str(e.value)
+
+
+def test_a_non_positive_request_deadline_is_refused(monkeypatch):
+    monkeypatch.setenv("PARE_HW_REQUEST_DEADLINE_S", "0")
+    with pytest.raises(ValueError):
+        load_config()
