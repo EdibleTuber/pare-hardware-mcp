@@ -67,3 +67,53 @@ def test_listing_reports_every_by_id_entry(fake_by_id):
 def test_listing_an_absent_root_is_empty_not_an_error(tmp_path):
     # A bench with no adapter plugged in is a normal state, not a failure.
     assert list_serial_devices(str(tmp_path / "nope")) == []
+
+
+def _make_by_id_symlink(tmp_path, name):
+    """Build a by-id lookalike symlink named `name`, pointing at a stand-in tty."""
+    root = tmp_path / "by-id"
+    root.mkdir(exist_ok=True)
+    tty = tmp_path / f"tty-for-{name}"
+    tty.write_text("")
+    link = root / name
+    link.symlink_to(tty)
+    return link
+
+
+# Regression fixture for a review finding: the only prior fixture (TIGARD) has
+# NO hyphen inside its vendor/model portion, so a naive `name.split("-")`
+# parser that assumes a fixed 4-part shape produces the same answer as the
+# correct from-the-right parse and every test above still passes. A real
+# vendor string can contain hyphens (e.g. FTDI-style "Future Technology
+# Devices" chip descriptors do), so this fixture pins that case specifically.
+HYPHENATED_VENDOR = "usb-Future-Technology-Devices_FT2232H_ABC123-if00-port0"
+
+
+def test_a_hyphenated_vendor_name_is_still_parsed_from_the_right(tmp_path):
+    link = _make_by_id_symlink(tmp_path, HYPHENATED_VENDOR)
+    dev = resolve_device(str(link), expect_serial="ABC123")
+    assert dev.serial == "ABC123"
+    assert dev.interface == "if00"
+
+
+# Two distinct "no serial" shapes: a name that parses into the expected
+# three hyphen-groups but has no serial encoded (legitimate -- invariant 3
+# says resolution proceeds and reports what it found) versus a name that
+# does not parse as a by-id name at all (a refusal -- invariants 1 and 4:
+# an unidentifiable device must not be silently handed back as "resolved").
+NO_SERIAL_ENCODED = "usb-NoSerialHere-if00-port0"
+NOT_A_BY_ID_NAME = "totally_not_a_by_id_shaped_name"
+
+
+def test_a_parseable_name_with_no_serial_encoded_still_resolves(tmp_path):
+    link = _make_by_id_symlink(tmp_path, NO_SERIAL_ENCODED)
+    dev = resolve_device(str(link), expect_serial=None)
+    assert dev.serial is None
+    assert dev.interface == "if00"
+
+
+def test_an_unparseable_by_id_name_is_refused_not_silently_resolved(tmp_path):
+    link = _make_by_id_symlink(tmp_path, NOT_A_BY_ID_NAME)
+    with pytest.raises(DeviceError) as e:
+        resolve_device(str(link), expect_serial=None)
+    assert str(link) in str(e.value)

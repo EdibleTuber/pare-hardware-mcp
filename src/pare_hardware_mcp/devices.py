@@ -32,7 +32,7 @@ class ResolvedDevice:
     interface: str | None
 
 
-def _parse_by_id_name(name: str) -> tuple[str | None, str | None]:
+def _parse_by_id_name(by_id_path: str, name: str) -> tuple[str | None, str]:
     """Pull (serial, interface) out of a udev by-id filename.
 
     The stock rule for a USB-serial adapter produces
@@ -42,10 +42,22 @@ def _parse_by_id_name(name: str) -> tuple[str | None, str | None]:
     piece's final underscore-separated field. Neither the vendor nor the
     model is assumed to be hyphen- or underscore-free -- only the position
     from the right is trusted.
+
+    A name that does not split into three hyphen-groups at all does not
+    look like a by-id name -- that is not an "unnamed device", it is a
+    device we cannot identify, and invariant 1/4 require refusing it rather
+    than returning a device with unknown serial and interface. A name that
+    *does* split into three groups but whose prefix carries no `_` (no
+    serial encoded) is a different, legitimate case -- serial is reported
+    as `None` and resolution proceeds (invariant 3).
     """
     parts = name.rsplit("-", 2)
     if len(parts) != 3:
-        return None, None
+        raise DeviceError(
+            f"{by_id_path} does not look like a by-id name (expected "
+            "usb-<vendor>_<model>_<serial>-<ifNN>-port0) -- refusing to "
+            "guess at an unidentifiable device"
+        )
     prefix, interface, _port = parts
     fields = prefix.split("_")
     serial = fields[-1] if len(fields) > 1 else None
@@ -71,7 +83,7 @@ def resolve_device(by_id_path: str, *, expect_serial: str | None) -> ResolvedDev
         )
 
     name = os.path.basename(by_id_path)
-    serial, interface = _parse_by_id_name(name)
+    serial, interface = _parse_by_id_name(by_id_path, name)
 
     if expect_serial is not None:
         if serial is None:
