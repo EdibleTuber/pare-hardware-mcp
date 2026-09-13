@@ -69,6 +69,13 @@ READ_CHUNK = 4096
 # worker -- the operator must always be able to let go of the port.
 JOIN_TIMEOUT = 2.0
 
+# `close` must not pull the fd out from under an in-flight `write`, so it waits
+# for `_write_lock`. `write` is bounded by the port's `write_timeout` (5s below)
+# and `cancel_write()` aborts it sooner, so this is slack on a bound that should
+# already have fired -- it exists only so that a `write_timeout` of None could
+# never leave the operator unable to let go of the port.
+WRITE_DRAIN_TIMEOUT = 6.0
+
 FLOW_MODES = ("none", "rtscts", "xonxoff")
 
 
@@ -235,15 +242,20 @@ class ConsoleSession:
     # -- operations -------------------------------------------------------
 
     def write(self, data: bytes) -> None:
-        """Put bytes on the line. Refuses rather than writing into the void."""
-        if self._closed:
-            raise SessionError(f"session {self.id} is closed")
-        reason = self.death_reason
-        if not self.alive:
-            raise SessionError(
-                f"session {self.id} is not alive, refusing to write: {reason}"
-            )
+        """Put bytes on the line. Refuses rather than writing into the void.
+
+        The liveness checks are inside `_write_lock`, not before it: outside,
+        they are check-then-act, and `_shutdown` can close the port in the gap
+        between the check passing and the write starting.
+        """
         with self._write_lock:
+            if self._closed:
+                raise SessionError(f"session {self.id} is closed")
+            if not self.alive:
+                raise SessionError(
+                    f"session {self.id} is not alive, refusing to write: "
+                    f"{self.death_reason}"
+                )
             try:
                 # No `flush()`. `write` is bounded by `write_timeout`, but
                 # `flush` is `tcdrain(2)` and has no timeout at all: under
@@ -251,6 +263,26 @@ class ConsoleSession:
                 # tool call for as long as the target stays silent. The bytes
                 # are in the kernel's tty buffer either way.
                 self._serial.write(data)
+            except serial.SerialTimeoutException as exc:
+                # NOT a death. `SerialTimeoutException` subclasses
+                # `SerialException` (serialutil.py:96), so lumping it in with
+                # the branch below would mark a perfectly healthy session dead
+                # and permanently: `_alive` is only ever set True in
+                # `__init__`. The target that does not assert CTS under
+                # flow="rtscts" -- the case invariant 4 exists for -- would
+                # cost one timeout and then write-brick the console for the
+                # rest of the session, while `status()` claimed the device was
+                # gone and the reader carried on capturing from it. A timeout
+                # is a bounded, recoverable refusal by the far end.
+                raise SessionError(
+                    f"write on session {self.id} timed out after "
+                    f"{self._serial.write_timeout}s: the target is not "
+                    f"accepting bytes (flow={self.flow}"
+                    + ("; under rtscts that is a target not asserting CTS"
+                       if self.flow == "rtscts" else "")
+                    + "). The session is still open and the capture is "
+                      "unaffected."
+                ) from exc
             except (serial.SerialException, OSError) as exc:
                 self._die(self._explain(exc, "write"))
                 raise SessionError(
@@ -264,28 +296,53 @@ class ConsoleSession:
         reader would not join, so the caller can surface it rather than have it
         vanish.
         """
-        warning = None
+        warnings: list[str] = []
         self._stop.set()
-        try:
-            self._serial.cancel_read()
-        except Exception:  # noqa: BLE001 -- best effort; the join bound covers us
-            pass
+        for cancel in (self._serial.cancel_read, self._serial.cancel_write):
+            try:
+                cancel()
+            except Exception:  # noqa: BLE001 -- best effort; the bounds below cover us
+                pass
         if self._reader.is_alive():
             self._reader.join(timeout=JOIN_TIMEOUT)
             if self._reader.is_alive():
-                warning = (
+                warnings.append(
                     f"reader thread for session {self.id} did not stop within "
                     f"{JOIN_TIMEOUT}s; releasing the port anyway"
                 )
+
+        # The fd must not be closed under an in-flight `write`. pyserial's
+        # `write` re-reads `self.fd` on every loop iteration
+        # (serialposix.py:621) while `close` sets it to None and closes it
+        # unconditionally (serialposix.py:529-541). Close it underneath a
+        # blocked writer and two things follow: `os.write(None, ...)` raises a
+        # bare TypeError straight out of `write()` past both except clauses,
+        # and -- worse -- the next `open` can be handed the same fd number, so
+        # this session's bytes are transmitted to the *next* session's physical
+        # target. The realistic way a write stays in flight that long is the
+        # CTS-low stall this module is built around, with console_send and
+        # console_close arriving as concurrent tool calls.
+        acquired = self._write_lock.acquire(timeout=WRITE_DRAIN_TIMEOUT)
         try:
-            self._serial.close()
-        except Exception:  # noqa: BLE001 -- an unplugged fd fails to close; the
-            pass           # session is over either way and must not hang here
-        with self._state_lock:
-            self._alive = False
-        self._closed = True
-        self._buffer = None
-        return warning
+            if not acquired:
+                warnings.append(
+                    f"a write on session {self.id} was still in flight after "
+                    f"{WRITE_DRAIN_TIMEOUT}s; releasing the port anyway"
+                )
+            try:
+                self._serial.close()
+            except Exception:  # noqa: BLE001 -- an unplugged fd fails to close;
+                pass           # the session is over and must not hang here
+            with self._state_lock:
+                self._alive = False
+            # Set inside `_write_lock` so a `write` waiting on it sees a closed
+            # session the moment it gets in, rather than writing to a dead fd.
+            self._closed = True
+            self._buffer = None
+        finally:
+            if acquired:
+                self._write_lock.release()
+        return "; ".join(warnings) if warnings else None
 
     def describe(self) -> dict:
         """The session half of `status()`. Every value derived, none cached."""
@@ -386,18 +443,27 @@ class SessionManager:
             port = self._open_port(resolved, baud=baud, flow=flow, dtr=dtr,
                                    rts=effective_rts)
 
-            session = ConsoleSession(
-                session_id="sess-" + uuid.uuid4().hex[:12],
-                device=resolved, port=port, baud=baud, flow=flow,
-                dtr=dtr, rts=effective_rts, capacity=self._capacity,
-            )
             try:
+                # Constructing the session allocates the capture buffer -- 64
+                # MiB by default -- so this is inside the guard, not outside
+                # it. `serial.Serial` does inherit `io.RawIOBase.__del__`, so
+                # a stranded port would eventually be closed by refcounting,
+                # but "eventually" is doing far too much work: a live
+                # traceback pins the frame that holds it, a reference cycle
+                # defers it to the collector, and until then the fd holds
+                # flock(LOCK_EX) on the tty while `_current` is still None --
+                # the manager reporting an idle bench whose port nothing can
+                # open. Release it here rather than leaving the one exclusive
+                # resource on this worker to the garbage collector.
+                session = ConsoleSession(
+                    session_id="sess-" + uuid.uuid4().hex[:12],
+                    device=resolved, port=port, baud=baud, flow=flow,
+                    dtr=dtr, rts=effective_rts, capacity=self._capacity,
+                )
                 # Invariant 2: capture is running before `open` returns, so the
                 # boot log is already accumulating when the caller first asks.
                 session._reader.start()
             except BaseException:
-                # A port held by a session nobody can reach is the worst
-                # outcome: it locks the bench until the worker restarts.
                 port.close()
                 raise
             self._current = session

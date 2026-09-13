@@ -666,6 +666,236 @@ def test_concurrent_reads_during_a_flood_stay_byte_exact(manager, pty):
 # write(), which tasks 5 and 6 depend on.
 # --------------------------------------------------------------------------
 
+# A pty's output buffer is a few KiB. Nobody drains the master in these tests,
+# so a blob this size is guaranteed to leave `write` blocked in the port --
+# which is the only way to get a write in flight deterministically.
+WEDGE = b"S" * (1 << 20)
+
+
+def drain(pty, rounds: int = 50) -> None:
+    while rounds and pty.recv(0.02):
+        rounds -= 1
+
+
+def test_close_waits_for_an_in_flight_write_before_releasing_the_port(manager, pty, second_pty):
+    """A write still in the port when `close` lands must not outlive the fd.
+
+    pyserial's `write` re-reads `self.fd` on every loop iteration
+    (serialposix.py:621) and `close` sets it to None and closes it
+    unconditionally (serialposix.py:529-541). Close the fd underneath a
+    blocked writer and the next session's `open` can be handed the same fd
+    number -- at which point session A's bytes are transmitted to session B's
+    physical target.
+    """
+    session = open_ok(manager, pty)
+    raised: list[tuple[str, str]] = []
+    finished = threading.Event()
+
+    def writer():
+        try:
+            session.write(WEDGE)
+        except BaseException as exc:  # noqa: BLE001 -- the type is the assertion
+            raised.append((type(exc).__name__, str(exc)))
+        finally:
+            finished.set()
+
+    thread = threading.Thread(target=writer, daemon=True)
+    thread.start()
+    time.sleep(0.2)
+    assert not finished.is_set(), "the write was not wedged; the test proves nothing"
+
+    manager.close(session.id)
+
+    # The discriminating assertion: close must not return while a write is
+    # still inside the port.
+    assert finished.is_set(), \
+        "close released the port with a write still in flight"
+
+    thread.join(DEADLINE)
+    assert all(kind == "SessionError" for kind, _ in raised), \
+        f"write must fail as SessionError or not at all, got {raised}"
+
+    # And the harm that race causes: session A's bytes on session B's target.
+    later = open_ok(manager, second_pty)
+    assert b"S" not in second_pty.recv(0.2), \
+        "bytes from the closed session reached the next session's target"
+    assert later.alive
+
+
+def test_write_after_close_is_refused(manager, pty):
+    session = open_ok(manager, pty)
+    manager.close(session.id)
+    with pytest.raises(SessionError):
+        session.write(b"too late\r\n")
+
+
+def test_a_write_timeout_does_not_mark_a_healthy_session_dead(manager, pty):
+    """`SerialTimeoutException` subclasses `SerialException` (serialutil.py:96).
+
+    Catching it with the rest and calling `_die` would brick the console for
+    the rest of the session -- and claim the device is gone while the reader
+    is still capturing from it. This is the live failure mode under
+    flow="rtscts" against a target that never asserts CTS, which is the exact
+    case invariant 4 exists for.
+    """
+    session = open_ok(manager, pty)
+    pty.send(b"boot log\r\n")
+    until(lambda: b"boot log" in session.buffer.read(0)[0], what="capture")
+
+    session._serial.write_timeout = 0.2  # 5s is the shipped value; too slow here
+    with pytest.raises(SessionError) as e:
+        session.write(WEDGE)
+    # Assert the relationship, not the wording: the refusal must be the port's
+    # own timeout surfaced as a SessionError, not a death.
+    assert isinstance(e.value.__cause__, serial.SerialTimeoutException)
+    assert session.id in str(e.value)
+
+    # A bounded, recoverable failure -- not a death.
+    assert session.alive is True
+    assert session.death_reason is None
+    assert manager.status()["alive"] is True
+    assert manager.status()["death_reason"] is None
+
+    # The reader never stopped, and the console is not write-bricked.
+    pty.send(b"target is still talking fine\r\n")
+    until(lambda: b"still talking fine" in session.buffer.read(0)[0],
+          what="the reader to carry on across the write timeout")
+    drain(pty)
+    session._serial.write_timeout = 5.0
+    session.write(b"and still writable\r\n")
+
+
+def test_a_real_write_failure_still_marks_the_session_dead(manager, pty):
+    """The other half: a timeout is recoverable, a vanished device is not.
+
+    The reader is silenced first so that the *write* path is the only thing
+    that can notice -- otherwise the reader wins the race every time and this
+    would pass with `_die` deleted from `write`.
+    """
+    session = open_ok(manager, pty)
+    session._stop.set()
+    session._serial.cancel_read()
+    session._reader.join(DEADLINE)
+    assert not session._reader.is_alive()
+    assert session.alive, "the reader, not the unplug, must be what stopped"
+
+    pty.unplug_far_end()
+    with pytest.raises(SessionError) as e:
+        session.write(b"anyone there?\r\n")
+
+    # EIO, not a timeout -- the two branches must stay distinguishable.
+    assert not isinstance(e.value.__cause__, serial.SerialTimeoutException)
+    assert session.alive is False
+    assert session.death_reason is not None
+    assert pty.by_id in session.death_reason
+
+
+def test_close_blocks_on_the_write_lock(manager, pty):
+    """White-box, deterministic: `close` must contend with `write`.
+
+    The behavioural test above can be satisfied by `cancel_write()` alone,
+    which only *requests* an abort and gives no ordering guarantee. This
+    asserts the lock itself, the way the buffer-lock test does.
+    """
+    session = open_ok(manager, pty)
+    closed = threading.Event()
+    failures: list[BaseException] = []
+
+    def closer():
+        try:
+            manager.close(session.id)
+        except BaseException as exc:  # noqa: BLE001
+            failures.append(exc)
+        finally:
+            closed.set()
+
+    with session._write_lock:
+        thread = threading.Thread(target=closer, daemon=True)
+        thread.start()
+        assert not closed.wait(0.3), \
+            "close released the port without waiting for the write lock"
+    assert closed.wait(DEADLINE), "close did not proceed once the lock was free"
+    thread.join(DEADLINE)
+    assert not failures, failures
+    assert manager.current is None
+
+
+def test_write_takes_the_lock_before_deciding_anything(manager, pty):
+    """White-box, deterministic: the liveness checks are inside `_write_lock`.
+
+    Checked outside, they are check-then-act: `_shutdown` can close the fd in
+    the gap between the check passing and the write starting. A closed session
+    is used because it makes the two placements behave differently -- with the
+    checks outside the lock, `write` refuses instantly without ever touching
+    it.
+    """
+    session = open_ok(manager, pty)
+    lock = session._write_lock
+    manager.close(session.id)
+
+    returned = threading.Event()
+    outcome: list[str] = []
+
+    def writer():
+        try:
+            session.write(b"x")
+            outcome.append("returned")
+        except BaseException as exc:  # noqa: BLE001
+            outcome.append(type(exc).__name__)
+        finally:
+            returned.set()
+
+    with lock:
+        thread = threading.Thread(target=writer, daemon=True)
+        thread.start()
+        assert not returned.wait(0.3), \
+            "write decided without taking the write lock first"
+    assert returned.wait(DEADLINE)
+    thread.join(DEADLINE)
+    assert outcome == ["SessionError"], outcome
+
+
+def test_a_failure_building_the_session_still_releases_the_port(manager, pty, monkeypatch):
+    """The 64 MiB capture buffer is allocated while the port is already open.
+
+    `serial.Serial` inherits `io.RawIOBase.__del__`, so a stranded port is
+    eventually closed by refcounting -- which is why this asserts on the port
+    object itself rather than on whether the tty can be reopened. Holding a
+    reference to it here is exactly the situation a live traceback or a
+    reference cycle creates in the worker: until the last reference goes, the
+    fd holds flock(LOCK_EX) on the tty while `_current` is still None, so the
+    manager reports an idle bench whose port nothing can open. `open` must
+    close it, not leave the one exclusive resource on this worker to the
+    garbage collector.
+    """
+    import pare_hardware_mcp.session as session_module
+
+    opened: list[serial.Serial] = []
+    real_open_port = SessionManager._open_port
+
+    def spy(self, resolved, **kwargs):
+        port = real_open_port(self, resolved, **kwargs)
+        opened.append(port)
+        return port
+
+    def explode(*args, **kwargs):
+        raise MemoryError("no room for the capture buffer")
+
+    monkeypatch.setattr(SessionManager, "_open_port", spy)
+    monkeypatch.setattr(session_module.ConsoleSession, "__init__", explode)
+
+    with pytest.raises(MemoryError):
+        open_ok(manager, pty)
+
+    assert opened, "the port was never opened; this test would prove nothing"
+    assert opened[0].is_open is False, \
+        "the port was left open by a failed open() -- it holds flock(LOCK_EX) " \
+        "on the tty for as long as anything references it"
+    assert manager.current is None
+    assert can_open_exclusively(os.path.realpath(pty.by_id))
+
+
+
 def test_write_puts_bytes_on_the_line(manager, pty):
     session = open_ok(manager, pty)
     session.write(b"help\r")
