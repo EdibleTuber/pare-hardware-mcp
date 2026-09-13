@@ -40,9 +40,10 @@ DEFAULT_CAPACITY = 64 * 1024 * 1024  # 64 MiB
 
 
 class CursorError(ValueError):
-    """A cursor ahead of `head` was requested.
+    """A cursor that was never a valid position was requested.
 
-    That is a caller bug (asking for bytes not yet written), not the normal
+    Raised for a cursor ahead of `head` (asking for bytes not yet written)
+    or negative (no such offset was ever handed out). Neither is the normal
     "fell behind and some bytes were dropped" case -- which is not an error
     at all, see `CaptureBuffer.read`.
     """
@@ -109,13 +110,15 @@ class CaptureBuffer:
     def read(self, cursor: int, limit: int | None = None) -> tuple[bytes, int, int, int]:
         """Return `(data, next_cursor, dropped, remaining)` from `cursor`.
 
-        - A `cursor` ahead of `head` raises `CursorError` -- that data has
-          not been written yet, which is a caller bug.
-        - A `cursor` behind the oldest byte still retained is the normal
-          "fell behind" case, not an error: `dropped` reports exactly how
-          many bytes between `cursor` and the oldest retained byte were
-          evicted by wraparound, and the read proceeds from that oldest
-          byte, returning it rather than raising or coming back empty.
+        - A `cursor` ahead of `head`, or negative, raises `CursorError` --
+          neither is a position this buffer ever handed out, so both are a
+          caller bug rather than a wrap condition.
+        - A `cursor` behind the oldest byte still retained (but still >= 0)
+          is the normal "fell behind" case, not an error: `dropped` reports
+          exactly how many bytes between `cursor` and the oldest retained
+          byte were evicted by wraparound, and the read proceeds from that
+          oldest byte, returning it rather than raising or coming back
+          empty.
         - `limit` bounds how many bytes come back from *this* call, not how
           far the cursor is allowed to advance: `next_cursor` reflects only
           the bytes actually returned (after `dropped` bytes, if any, were
@@ -129,6 +132,17 @@ class CaptureBuffer:
                 f"cursor {cursor} is ahead of head {self.head} -- "
                 "that data has not been written yet"
             )
+        if cursor < 0:
+            # A negative offset was never a legitimate position: `head` and
+            # every `next_cursor` this buffer has ever returned are >= 0 by
+            # construction, so a caller only ever passes a negative cursor
+            # by way of a bug -- symmetric with "cursor ahead of head", not
+            # with "fell behind" (invariant 5 presumes a cursor that was
+            # once real and got left behind through eviction). Clamping it
+            # into `dropped` would report phantom bytes for offsets that
+            # never existed, which is exactly the silently-wrong-dropped
+            # failure this module exists to prevent.
+            raise CursorError(f"cursor {cursor} is negative -- not a valid offset")
 
         oldest_retained = max(0, self.head - self.capacity)
         dropped = max(0, oldest_retained - cursor)

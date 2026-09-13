@@ -100,23 +100,71 @@ def test_a_cursor_beyond_head_raises_rather_than_being_clamped():
         buf.read(buf.head + 1)
 
 
-def test_bytes_returned_plus_dropped_equals_cursor_advance_over_random_sequences():
-    # The identity that must hold for ANY sequence of appends and reads:
-    # bytes_returned + dropped == next_cursor - cursor. Asserted as a
-    # relationship, not a magic number, so it survives any legitimate
-    # change to capacity, chunk size, or read pattern. Driven by a fixed
-    # seed so failures reproduce.
+def test_a_negative_cursor_raises_rather_than_inflating_dropped():
+    # `head` and every `next_cursor` this buffer has ever returned are >= 0
+    # by construction, so a negative cursor only ever reaches `read` via a
+    # caller bug -- symmetric with a cursor ahead of `head`, which already
+    # raises. Concretely, in this scenario head=15 and oldest_retained=5,
+    # so read(0) correctly reports dropped=5 (the real offsets 0..4). Before
+    # this check existed, `dropped = max(0, oldest_retained - cursor)` had
+    # no floor at cursor=0, so read(-5) reported dropped=10: five phantom
+    # bytes for offsets -5..-1, which were never written, stacked on top of
+    # the five real ones.
+    buf = CaptureBuffer(capacity=10)
+    buf.append(b"0123456789")
+    buf.append(b"ABCDE")
+    with pytest.raises(CursorError):
+        buf.read(-5)
+
+
+def test_read_matches_an_independent_reference_model_over_random_sequences():
+    # The property test this replaces asserted
+    # `len(data) + dropped == next_cursor - cursor`, which turned out to be
+    # a tautology: given the implementation's own `dropped = start - cursor`
+    # and `next_cursor = start + to_return`, that identity is algebra on
+    # `start` and holds for ANY value `start` takes -- including a
+    # hypothetical bug where `oldest_retained` were hardcoded to 0 and
+    # `dropped` were always 0, silently never reporting an eviction. It
+    # tested the return tuple's internal self-consistency, not whether
+    # `dropped` or the returned bytes are actually correct.
+    #
+    # This version checks against an independent oracle: a plain,
+    # ever-growing bytearray that records every byte ever appended and
+    # never evicts anything, so it cannot share the ring's wraparound
+    # arithmetic -- or any bug in it -- with the code under test. Ground
+    # truth for what a fixed-capacity ring can still be holding is derived
+    # from that oracle's own length and the known `capacity`, not from any
+    # of `CaptureBuffer`'s attributes or helper methods.
     rng = random.Random(20260913)
-    for _capacity in (1, 2, 7, 16, 137, 4096):
-        buf = CaptureBuffer(capacity=_capacity)
+    for capacity in (1, 2, 7, 16, 137, 4096):
+        buf = CaptureBuffer(capacity=capacity)
+        reference = bytearray()  # everything ever appended, absolute-offset indexed
         cursor = 0
         for _ in range(300):
             if rng.random() < 0.6:
-                n = rng.randint(0, _capacity * 3)
-                buf.append(rng.randbytes(n))
+                chunk = rng.randbytes(rng.randint(0, capacity * 3))
+                buf.append(chunk)
+                reference.extend(chunk)
             else:
-                limit = rng.choice([None, 0, 1, rng.randint(1, _capacity * 3)])
+                limit = rng.choice([None, 0, 1, rng.randint(1, capacity * 3)])
                 data, next_cursor, dropped, remaining = buf.read(cursor, limit)
-                assert len(data) + dropped == next_cursor - cursor
-                assert remaining == buf.head - next_cursor
+
+                # The offset the returned bytes claim to start at, per the
+                # buffer's own report of how much it dropped -- checked
+                # against the oracle's independently-held content, not
+                # against anything the buffer computed internally.
+                start = cursor + dropped
+                assert bytes(reference[start:start + len(data)]) == data
+
+                # Ground truth for `dropped`: everything the oracle has
+                # ever seen "existed"; a `capacity`-sized ring can only
+                # ever retain the last `capacity` of those bytes, which is
+                # a fact about fixed-size ring buffers, not a number pulled
+                # from this implementation.
+                oldest_survivor = max(0, len(reference) - capacity)
+                expected_dropped = max(0, oldest_survivor - cursor)
+                assert dropped == expected_dropped
+
+                assert buf.head == len(reference)
+                assert remaining == len(reference) - next_cursor
                 cursor = next_cursor
