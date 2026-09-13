@@ -10,7 +10,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "mcp>=1.27.0,<2",   # 2.0 renamed streamablehttp_client; agent_core targets 1.x
-    "pare-worker-kit @ git+https://github.com/EdibleTuber/pare-worker-kit.git@v0.1.2",
+    "pare-worker-kit @ git+https://github.com/EdibleTuber/pare-worker-kit.git@v0.2.0",
     "pyserial>=3.5",
 ]
 
