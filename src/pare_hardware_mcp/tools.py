@@ -25,8 +25,8 @@ from pare_hardware_mcp.devices import list_serial_devices
 from pare_hardware_mcp.ringbuffer import CursorError
 from pare_hardware_mcp.session import SessionError, SessionManager
 
-MANAGER = SessionManager()
 CONFIG = load_config()
+MANAGER = SessionManager(capacity=CONFIG.buffer_bytes)
 
 # A `.bench-store-id` value reaches an operator's terminal via bench_status --
 # the same "escape sequence rewrites what the operator sees" problem the
@@ -327,12 +327,17 @@ async def bench_status() -> str:
 
     §8.4 (see pare/commands/health.py) puts the live artifact-root answer
     behind this low-tier tool because the daemon resolving the path itself
-    would resolve against the wrong machine's filesystem. Reads the
-    environment fresh on every call, not the module-level `CONFIG` snapshot
-    taken at import time: this worker is reached over `streamable_http`, so
-    `Environment=` in the systemd unit is the only channel an operator has,
-    and a unit reload must be visible on the next call rather than requiring
-    a worker restart.
+    would resolve against the wrong machine's filesystem. Calls `load_config()`
+    fresh on every call rather than reading the module-level `CONFIG`
+    snapshot -- not for any live-reload reason (a running process's
+    `os.environ` is fixed at exec time; changing the unit's `Environment=`
+    needs `systemctl restart`, which re-execs and would refresh a frozen
+    `CONFIG` just as well). The real reason is test-shaped: this tool's tests
+    use `monkeypatch.setenv`, while `console_open`'s use
+    `monkeypatch.setattr(tools, "CONFIG", ...)` -- a frozen singleton can't
+    observe `setenv`. CONFIG-vs-`load_config()` is not yet one convention
+    across this file; whoever next adds a field consumed by both `console_open`
+    and `bench_status` needs to pick one rather than let the divergence grow.
 
     Never opens, closes or otherwise dispatches against a session -- `status`
     is read-only, matching this tool's low tier.
