@@ -50,6 +50,9 @@ def install(monkeypatch, session=None, deadline=60.0):
     return manager
 
 
+GAP = {"at_cursor": 42, "duration_s": 12.0, "reason": "baud scan"}
+
+
 def winner_result(original=9600, final=115200):
     return {
         "samples": {9600: b"\x00\x00garbage\xff", 115200: b"U-Boot\r\nhello\r\n"},
@@ -58,6 +61,7 @@ def winner_result(original=9600, final=115200):
         "restored": final == original,
         "alive": True,
         "death_reason": None,
+        "gap": GAP,
     }
 
 
@@ -164,7 +168,7 @@ async def test_no_clear_winner_reports_the_restored_rate(monkeypatch):
     result = {
         "samples": {9600: bytes(range(128, 256)), 115200: bytes(range(128, 256))},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
-        "alive": True, "death_reason": None,
+        "alive": True, "death_reason": None, "gap": GAP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -178,7 +182,7 @@ async def test_a_totally_silent_line_names_ground_and_crossover(monkeypatch):
     result = {
         "samples": {9600: b"", 115200: b""},
         "original_baud": 9600, "final_baud": 9600, "restored": True,
-        "alive": True, "death_reason": None,
+        "alive": True, "death_reason": None, "gap": GAP,
     }
     session = FakeSession(scan_result=result)
     install(monkeypatch, session=session)
@@ -186,6 +190,18 @@ async def test_a_totally_silent_line_names_ground_and_crossover(monkeypatch):
     assert out["verdict"] == "no_data_at_any_rate"
     assert "ground" in out["hint"].lower()
     assert "tx" in out["hint"].lower() and "rx" in out["hint"].lower()
+
+
+# --------------------------------------------------------------------------
+# Critical 1: a scan's own capture suspension must be visible in its result,
+# not only inferable later from console_status/console_read.
+# --------------------------------------------------------------------------
+
+async def test_the_scans_own_capture_gap_is_reported(monkeypatch):
+    session = FakeSession(scan_result=winner_result())
+    install(monkeypatch, session=session)
+    out = json.loads(await tools.console_detect_baud())
+    assert out["capture_gap"] == GAP
 
 
 async def test_a_session_error_from_the_scan_is_reported_not_raised(monkeypatch):

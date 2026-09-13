@@ -21,6 +21,10 @@ def live(monkeypatch):
         flow = "none"
         def __init__(self):
             self.buffer = CaptureBuffer(capacity=1024)
+            self.gaps = []
+        def gaps_overlapping(self, start_cursor, end_cursor):
+            return [dict(g) for g in self.gaps
+                    if start_cursor <= g["at_cursor"] <= end_cursor]
 
     class FakeManager:
         def __init__(self):
@@ -63,6 +67,39 @@ async def test_reading_an_unknown_session_is_an_error_naming_it(live):
     out = json.loads(await tools.console_read(session="nope", cursor=0))
     assert out["error"]
     assert "nope" in out["error"]
+
+
+async def test_read_reports_no_capture_gaps_when_none_were_recorded(live):
+    live.current.buffer.append(b"abc")
+    out = json.loads(await tools.console_read(session="s-1", cursor=0))
+    assert out["capture_gaps"] == []
+
+
+async def test_read_flags_a_capture_gap_whose_cursor_falls_inside_the_window(live):
+    # A suspension leaves no byte range in cursor space -- capture just stops
+    # advancing `head` and resumes from the same offset -- so `dropped` alone
+    # cannot report it. A read spanning across the recorded cursor must.
+    live.current.buffer.append(b"before")
+    live.current.gaps.append({"at_cursor": 6, "duration_s": 12.0, "reason": "baud scan"})
+    live.current.buffer.append(b"after")
+
+    out = json.loads(await tools.console_read(session="s-1", cursor=0))
+    assert out["dropped"] == 0, "no bytes were evicted -- the hole is temporal, not spatial"
+    assert out["capture_gaps"] == [{"at_cursor": 6, "duration_s": 12.0, "reason": "baud scan"}]
+
+
+async def test_read_does_not_flag_a_gap_outside_the_returned_window(live):
+    live.current.buffer.append(b"0123456789")
+    live.current.gaps.append({"at_cursor": 6, "duration_s": 12.0, "reason": "baud scan"})
+
+    # A read that never reaches offset 6 must not report a gap that lies past it.
+    out = json.loads(await tools.console_read(session="s-1", cursor=0, limit=3))
+    assert out["next_cursor"] == 3
+    assert out["capture_gaps"] == []
+
+    # A read that starts after the gap must not report it either.
+    out = json.loads(await tools.console_read(session="s-1", cursor=7))
+    assert out["capture_gaps"] == []
 
 
 async def test_read_with_an_invalid_cursor_returns_an_error_not_an_exception(live):

@@ -48,10 +48,18 @@ async def console_read(session: str, cursor: int = 0,
         # case. Let it escape and it becomes an opaque transport-level
         # failure instead of something the model can read and correct.
         return _err(f"invalid cursor {cursor} for session {session!r}")
+    # `dropped` only ever counts bytes evicted by ring-buffer wraparound --
+    # it cannot see a capture that was SUSPENDED (a baud scan pausing the
+    # reader), because that leaves no byte range in cursor space at all,
+    # only a hole in time. `capture_gaps` is the other half: any suspension
+    # whose recorded cursor position falls inside the window just returned,
+    # so this byte-contiguous stream does not read as an unbroken one to
+    # whatever -- a language model, most likely -- consumes it next.
+    capture_gaps = sess.gaps_overlapping(next_cursor - len(data), next_cursor)
     return _ok(session=session,
                data_b64=base64.b64encode(data).decode("ascii"),
                next_cursor=next_cursor, dropped=dropped, remaining=remaining,
-               alive=sess.alive)
+               alive=sess.alive, capture_gaps=capture_gaps)
 
 
 async def console_status() -> str:
@@ -194,6 +202,11 @@ async def console_detect_baud(device: str | None = None,
         alive=result["alive"],
         death_reason=result["death_reason"],
         candidates=candidates,
+        # This scan suspended the reader for the duration of the sampling --
+        # a real hole in the boot log, not just an implementation detail.
+        # Also visible later via console_status (running totals) and
+        # console_read (flagged on whichever read's window crosses it).
+        capture_gap=result["gap"],
     )
     if all_silent(samples):
         response["verdict"] = "no_data_at_any_rate"

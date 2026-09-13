@@ -52,6 +52,7 @@ import uuid
 
 import serial
 
+from .baud import MAX_BAUD_RATE
 from .devices import ResolvedDevice, resolve_device
 from .ringbuffer import DEFAULT_CAPACITY, CaptureBuffer
 
@@ -155,6 +156,18 @@ class ConsoleSession:
         # speed underneath what would otherwise be a live capture.
         self._scan_pause = threading.Event()
         self._scan_parked = threading.Event()
+        # A gap ledger, out-of-band from the byte-exact capture (tools.py
+        # requires the capture stay byte-exact evidence, so a gap can never
+        # be an in-band marker). `CaptureBuffer.read` already reports
+        # `dropped` for bytes evicted by wraparound; it has no way to report
+        # bytes that were never captured at all, because the cursor space it
+        # works in has nothing to record there -- a suspended capture leaves
+        # no hole in the byte stream, only a hole in time. Recorded here
+        # instead: `{at_cursor, duration_s, reason}` per suspension, a leaf
+        # lock of its own so a reader (`console_status`, `console_read`)
+        # never has to take `_write_lock` or `_state_lock` to see it.
+        self._gaps: list[dict] = []
+        self._gaps_lock = threading.Lock()
         self._reader = threading.Thread(
             target=self._read_forever,
             name=f"console-reader-{session_id}",
@@ -192,6 +205,38 @@ class ConsoleSession:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def _record_gap(self, *, at_cursor: int, duration_s: float, reason: str) -> dict:
+        """Log a capture suspension. Returns the entry, for the caller that
+        just caused it (`scan_baud`) to hand back in its own result too."""
+        entry = {"at_cursor": at_cursor, "duration_s": round(duration_s, 3),
+                 "reason": reason}
+        with self._gaps_lock:
+            self._gaps.append(entry)
+        return entry
+
+    def gaps_overlapping(self, start_cursor: int, end_cursor: int) -> list[dict]:
+        """Every gap whose `at_cursor` sits inside `[start_cursor, end_cursor]`.
+
+        A suspension leaves no byte range in cursor space -- capture just
+        stops advancing `head` for a while and resumes from the same offset,
+        so there is nothing for `dropped` to count. What CAN be checked is
+        whether a `read()` call's returned window straddles the point where
+        that happened: if so, the bytes on either side of `at_cursor` look
+        perfectly contiguous to the caller, and it is exactly that caller --
+        the one reasoning over what it just read -- who needs to be told.
+        """
+        with self._gaps_lock:
+            return [dict(g) for g in self._gaps
+                    if start_cursor <= g["at_cursor"] <= end_cursor]
+
+    def gap_summary(self) -> dict:
+        """Count and total seconds of every capture suspension so far."""
+        with self._gaps_lock:
+            return {
+                "count": len(self._gaps),
+                "total_seconds": round(sum(g["duration_s"] for g in self._gaps), 3),
+            }
 
     @property
     def age_s(self) -> float:
@@ -388,17 +433,40 @@ class ConsoleSession:
         interrupts whichever read is in flight, so the scan aborts and
         releases `_write_lock` well inside `_shutdown`'s own drain timeout.
 
+        Every candidate value must be a positive integer no larger than
+        `MAX_BAUD_RATE` -- defence in depth alongside `baud.sanitize_rates`,
+        since pyserial's custom-baud path turns a kernel-rejected rate into
+        `ValueError` and the termios `array('i')` store overflows for
+        anything at or above 2**31, neither of which is safe to leave
+        unhandled from a tier-low, never-prompted tool.
+
+        However this returns or raises, the port is left at a KNOWN rate
+        (the winner, or the rate the session started at) and `self.baud`
+        matches it -- a bad-but-in-range candidate that pyserial itself
+        rejects must never leave the line at whatever tcsetattr last
+        applied while `self.baud` still claims something else.
+
+        Pausing the reader for the scan means capture stops advancing for
+        `sample_seconds * len(candidates actually sampled)` or more -- a real
+        gap in the boot log a caller could otherwise reason straight across.
+        That gap is recorded via `_record_gap` (see its docstring) whenever
+        the reader actually parked, regardless of how the scan ends, and is
+        returned here as `"gap"`.
+
         Raises `SessionError` for a bad rate list, a session that is not
-        alive, or a reader that will not park -- always BEFORE the port is
-        touched.
+        alive, a reader that will not park, a candidate rate the hardware
+        rejects, or a `decide` callback that raises -- always with the port
+        left at a known rate.
         """
         if not rates:
             raise SessionError("scan_baud: no candidate rates given")
-        if any((not isinstance(r, int)) or isinstance(r, bool) or r <= 0
-               for r in rates):
+        if any((not isinstance(r, int)) or isinstance(r, bool)
+               or not (0 < r <= MAX_BAUD_RATE) for r in rates):
             raise SessionError(
                 f"scan_baud: refusing rate list {rates!r} -- every rate must "
-                "be a positive integer; 0 deasserts the modem control lines"
+                "be a positive integer no greater than "
+                f"{MAX_BAUD_RATE} (0 deasserts the modem control lines; "
+                "pyserial's custom-baud path can raise for anything larger)"
             )
 
         acquired = self._write_lock.acquire(timeout=WRITE_DRAIN_TIMEOUT)
@@ -421,6 +489,15 @@ class ConsoleSession:
 
             original_baud = self.baud
             samples: dict[int, bytes] = {}
+            winner: int | None = None
+            # Pre-set to the fallback: if anything below raises before a
+            # winner is chosen, the `finally` still restores a KNOWN rate
+            # rather than leaving the port at whatever the failed candidate
+            # left in the termios struct.
+            final_baud = original_baud
+            gap_start_time: float | None = None
+            gap_at_cursor: int | None = None
+            gap_entry: dict | None = None
 
             self._scan_pause.set()
             try:
@@ -432,47 +509,100 @@ class ConsoleSession:
                         "rather than risk two readers on one port"
                     )
 
-                for rate in rates:
-                    if self._stop.is_set() or self._closing.is_set():
-                        break
-                    try:
-                        self._serial.baudrate = rate
-                        # Discard whatever is sitting in the driver's input
-                        # queue from the PREVIOUS candidate rate (or from
-                        # before the scan started): those bytes were framed
-                        # at a different speed and are not evidence about
-                        # `rate`.
-                        self._serial.reset_input_buffer()
-                    except (serial.SerialException, OSError) as exc:
-                        self._die(self._explain(exc, "baud scan (set rate)"))
-                        break
+                # The gap begins here, not at `_scan_pause.set()`: this is
+                # the instant the reader has actually stopped reading, which
+                # is also the instant `head` stops advancing.
+                buffer = self._buffer
+                gap_at_cursor = buffer.head if buffer is not None else 0
+                gap_start_time = time.monotonic()
 
-                    collected = bytearray()
-                    deadline = time.monotonic() + sample_seconds
-                    while (time.monotonic() < deadline
-                           and not self._stop.is_set()
-                           and not self._closing.is_set()):
-                        try:
-                            chunk = self._serial.read(READ_CHUNK)
-                        except (serial.SerialException, OSError) as exc:
-                            self._die(self._explain(exc, "baud scan (read)"))
-                            break
-                        if chunk:
-                            collected.extend(chunk)
-                    samples[rate] = bytes(collected)
-                    if not self.alive:
-                        break
-
-                winner = decide(samples) if samples else None
-                final_baud = winner if winner is not None else original_baud
                 try:
-                    self._serial.baudrate = final_baud
-                    self._serial.reset_input_buffer()
-                except (serial.SerialException, OSError):
-                    pass  # the device is already gone; nothing more to do
-                self.baud = final_baud
+                    for rate in rates:
+                        if self._stop.is_set() or self._closing.is_set():
+                            break
+                        try:
+                            self._serial.baudrate = rate
+                            # Discard whatever is sitting in the driver's
+                            # input queue from the PREVIOUS candidate rate
+                            # (or from before the scan started): those bytes
+                            # were framed at a different speed and are not
+                            # evidence about `rate`. This does discard a
+                            # few genuine at-the-original-rate bytes the
+                            # driver had queued but the reader had not yet
+                            # drained -- an unavoidable part of the same
+                            # gap, which is exactly why the gap is measured
+                            # from `gap_start_time` (before this call), not
+                            # from the first candidate's read loop.
+                            self._serial.reset_input_buffer()
+                        except (serial.SerialException, OSError) as exc:
+                            self._die(self._explain(exc, "baud scan (set rate)"))
+                            raise SessionError(
+                                f"session {self.id}: setting {rate} baud "
+                                f"failed and the device looks gone: "
+                                f"{self.death_reason}"
+                            ) from exc
+                        except (ValueError, OverflowError) as exc:
+                            # pyserial's custom-baud path converts a
+                            # kernel-rejected rate to ValueError
+                            # (serialposix.py's _set_special_baudrate), and
+                            # the termios array('i') store raises
+                            # OverflowError for a rate that does not fit a
+                            # C int (>= 2**31). Neither means the device is
+                            # gone -- a healthy session must not be `_die`d
+                            # over one bad candidate value.
+                            raise SessionError(
+                                f"session {self.id}: {rate} is not a usable "
+                                f"baud rate on this hardware: {exc}"
+                            ) from exc
+
+                        collected = bytearray()
+                        deadline = time.monotonic() + sample_seconds
+                        while (time.monotonic() < deadline
+                               and not self._stop.is_set()
+                               and not self._closing.is_set()):
+                            try:
+                                chunk = self._serial.read(READ_CHUNK)
+                            except (serial.SerialException, OSError) as exc:
+                                self._die(self._explain(exc, "baud scan (read)"))
+                                break
+                            if chunk:
+                                collected.extend(chunk)
+                        samples[rate] = bytes(collected)
+                        if not self.alive:
+                            break
+
+                    try:
+                        winner = decide(samples) if samples else None
+                    except Exception as exc:  # noqa: BLE001 -- a 3rd-party
+                        # decide callback must not escape as anything other
+                        # than SessionError, and must not skip the restore
+                        # below (it runs in the enclosing `finally`).
+                        raise SessionError(
+                            f"session {self.id}: the baud-scan decision "
+                            f"callback raised: {type(exc).__name__}: {exc}"
+                        ) from exc
+                    final_baud = winner if winner is not None else original_baud
+                finally:
+                    # Runs on every path out of the block above -- success,
+                    # break, or an exception -- so the port is NEVER left at
+                    # an undefined rate with `self.baud` claiming something
+                    # else. `final_baud` defaults to `original_baud` (set
+                    # before the try), so a bad candidate mid-loop restores
+                    # the rate the session started at.
+                    try:
+                        self._serial.baudrate = final_baud
+                        self._serial.reset_input_buffer()
+                    except Exception:  # noqa: BLE001 -- best effort; the
+                        pass          # device may already be gone
+                    self.baud = final_baud
             finally:
                 self._scan_pause.clear()
+                if gap_start_time is not None:
+                    gap_entry = self._record_gap(
+                        at_cursor=gap_at_cursor,
+                        duration_s=time.monotonic() - gap_start_time,
+                        reason="baud scan",
+                    )
         finally:
             self._write_lock.release()
 
@@ -488,6 +618,7 @@ class ConsoleSession:
             "restored": winner is None,
             "alive": self.alive,
             "death_reason": self.death_reason,
+            "gap": gap_entry,
         }
 
     def _shutdown(self) -> str | None:
@@ -591,6 +722,7 @@ class ConsoleSession:
         dropped = None if buffer is None else max(0, head - capacity)
         with self._state_lock:
             alive, death_reason = self._alive, self._death_reason
+        gaps = self.gap_summary()
         return {
             "open": True,
             "session": self.id,
@@ -609,6 +741,8 @@ class ConsoleSession:
             "buffer_head": head,
             "buffer_capacity": capacity,
             "dropped": dropped,
+            "capture_gap_count": gaps["count"],
+            "capture_gap_seconds": gaps["total_seconds"],
         }
 
 
@@ -624,6 +758,7 @@ class SessionManager:
         "open", "session", "device", "tty", "serial", "interface", "baud",
         "flow", "dtr", "rts", "opened_at", "age_s", "alive", "death_reason",
         "buffer_head", "buffer_capacity", "dropped",
+        "capture_gap_count", "capture_gap_seconds",
     )
 
     def __init__(self, *, capacity: int = DEFAULT_CAPACITY) -> None:

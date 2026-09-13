@@ -24,6 +24,7 @@ import time
 import pytest
 import serial
 
+from pare_hardware_mcp.baud import MAX_BAUD_RATE
 from pare_hardware_mcp.devices import DeviceError
 from pare_hardware_mcp.ringbuffer import CaptureBuffer
 from pare_hardware_mcp.session import (WRITE_DRAIN_TIMEOUT, ConsoleSession,
@@ -1237,7 +1238,7 @@ def test_scan_baud_rejects_a_zero_rate_before_touching_the_port(manager, pty):
 
 def test_scan_baud_rejects_a_negative_or_non_integer_rate(manager, pty):
     session = open_ok(manager, pty)
-    for bad_rates in ((9600, -1), (9600, True), (9600, 3.5)):
+    for bad_rates in ((9600, -1), (9600, True), (9600, 3.5), (9600, MAX_BAUD_RATE + 1)):
         with pytest.raises(SessionError):
             session.scan_baud(bad_rates, 0.1, no_op_decide)
 
@@ -1272,16 +1273,31 @@ def test_scan_baud_never_writes_to_the_target(manager, pty):
 
 
 def test_scan_baud_never_closes_and_reopens_the_port(manager, pty):
-    """Invariant 1: change speed via termios on the held fd, never reopen."""
+    """Invariant 1: change speed via termios on the held fd, never reopen.
+
+    NOT testable by comparing fd numbers before and after: reopening the
+    SAME Serial object preserves object identity, and `os.open` hands back
+    the lowest free fd -- which, immediately after `close()`, is the one
+    just released. A close-then-reopen-per-candidate mutant passes both
+    `session._serial is serial_obj` and `fileno() == fd_before` -- confirmed
+    by mutating scan_baud to do exactly that; the old version of this test
+    passed against it. Spying on `open`/`close` observes the effect that
+    actually matters instead.
+    """
     session = open_ok(manager, pty)
     serial_obj = session._serial
-    fd_before = serial_obj.fileno()
+    open_calls = []
+    close_calls = []
+    real_open, real_close = serial_obj.open, serial_obj.close
+    serial_obj.open = lambda *a, **k: (open_calls.append(1), real_open(*a, **k))[1]
+    serial_obj.close = lambda *a, **k: (close_calls.append(1), real_close(*a, **k))[1]
 
     session.scan_baud((9600, 115200, 230400), 0.1, lambda s: 115200)
 
-    assert session._serial is serial_obj, "the port object was replaced"
+    assert open_calls == [], f"scan_baud opened the port {len(open_calls)} time(s)"
+    assert close_calls == [], f"scan_baud closed the port {len(close_calls)} time(s)"
+    assert session._serial is serial_obj
     assert session._serial.is_open
-    assert session._serial.fileno() == fd_before, "the fd changed -- a reopen happened"
 
 
 def test_scan_baud_leaves_the_port_at_the_decided_winner(manager, pty):
@@ -1310,6 +1326,140 @@ def test_scan_baud_reports_a_winner_that_matches_the_original_rate_as_a_win(mana
     assert result["restored"] is False
 
 
+# --------------------------------------------------------------------------
+# Critical 1: the pause is a real capture gap, and it must be visible --
+# never as an in-band buffer marker (the capture must stay byte-exact
+# evidence), always out-of-band and surfaced at the point of reading.
+# --------------------------------------------------------------------------
+
+def test_scan_baud_records_a_gap_spanning_the_whole_suspension(manager, pty):
+    session = open_ok(manager, pty)
+    pty.send(b"before the scan\r\n")
+    until(lambda: session.buffer.head > 0, what="pre-scan capture")
+    cursor_before = session.buffer.head
+
+    result = session.scan_baud((9600, 115200), 0.2, no_op_decide)
+
+    gap = result["gap"]
+    assert gap is not None
+    assert gap["at_cursor"] == cursor_before, \
+        "the gap must start where capture actually stopped, not at head==0"
+    assert gap["duration_s"] >= 0.2, \
+        "two 0.2s candidates must show up as at least that much suspended time"
+    assert gap["reason"] == "baud scan"
+
+
+def test_a_gap_is_visible_in_status_as_a_running_count_and_total(manager, pty):
+    session = open_ok(manager, pty)
+    before = manager.status()
+    assert before["capture_gap_count"] == 0
+    assert before["capture_gap_seconds"] == 0
+
+    session.scan_baud((9600, 115200), 0.1, no_op_decide)
+    after_one = manager.status()
+    assert after_one["capture_gap_count"] == 1
+    assert after_one["capture_gap_seconds"] > 0
+
+    session.scan_baud((9600, 115200), 0.1, no_op_decide)
+    after_two = manager.status()
+    assert after_two["capture_gap_count"] == 2
+    assert after_two["capture_gap_seconds"] > after_one["capture_gap_seconds"]
+
+
+def test_a_failed_scan_still_records_its_gap(manager, pty):
+    """The reader was still paused for the duration, even though the scan
+    itself failed -- that suspended time must not disappear from the ledger
+    just because nothing useful came of it."""
+    session = open_ok(manager, pty)
+
+    def exploding_decide(samples):
+        raise RuntimeError("boom")
+
+    with pytest.raises(SessionError):
+        session.scan_baud((9600, 115200), 0.1, exploding_decide)
+
+    assert manager.status()["capture_gap_count"] == 1
+
+
+def test_gaps_overlapping_flags_only_gaps_inside_the_requested_window(manager, pty):
+    session = open_ok(manager, pty)
+    pty.send(b"pre-scan\r\n")
+    until(lambda: session.buffer.head > 0, what="pre-scan capture")
+
+    session.scan_baud((9600, 115200), 0.1, no_op_decide)
+    at_cursor = session._gaps[0]["at_cursor"]
+    assert at_cursor > 0, "the gap must start after the pre-scan bytes, not at 0"
+
+    assert session.gaps_overlapping(0, at_cursor) != []
+    assert session.gaps_overlapping(at_cursor, at_cursor + 1000) != []
+    assert session.gaps_overlapping(at_cursor + 1, at_cursor + 1000) == []
+    assert session.gaps_overlapping(0, at_cursor - 1) == []
+
+
+# --------------------------------------------------------------------------
+# Critical 2: a bad-but-positive candidate rate must not corrupt the line
+# speed, must not skip the restore, and must not silently die a healthy
+# session or escape tools.py as something other than SessionError.
+# --------------------------------------------------------------------------
+
+class _BaudRejectingSerial:
+    """Wraps a real, already-open `serial.Serial`; setting `baudrate` to
+    `fail_rate` raises `exc` instead of touching the port -- reproducing
+    pyserial's own custom-baud failure modes (ValueError from a
+    kernel-rejected rate, OverflowError from the termios `array('i')` store
+    for a rate >= 2**31) without depending on a specific rate actually being
+    rejected by whatever this test happens to run against."""
+
+    def __init__(self, real, fail_rate, exc):
+        object.__setattr__(self, "_real", real)
+        object.__setattr__(self, "_fail_rate", fail_rate)
+        object.__setattr__(self, "_exc", exc)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_real"), name)
+
+    def __setattr__(self, name, value):
+        if name == "baudrate" and value == object.__getattribute__(self, "_fail_rate"):
+            raise object.__getattribute__(self, "_exc")
+        setattr(object.__getattribute__(self, "_real"), name, value)
+
+
+@pytest.mark.parametrize("exc", [ValueError("kernel rejected it"),
+                                 OverflowError("Python int too large to convert to C int")])
+def test_a_hardware_rejected_rate_restores_and_raises_without_dying(manager, pty, exc):
+    """Reproduces the review's finding against `rates=[9600, 2147483648, 115200]`:
+    pyserial converts a kernel-rejected custom rate to ValueError, and the
+    array('i') termios struct overflows for a rate >= 2**31 -- before this
+    fix, neither was caught, the restore (originally placed after the loop)
+    was skipped, and the port was left at whatever tcsetattr had already
+    applied while `self.baud` kept reporting the old value.
+    """
+    session = open_ok(manager, pty, baud=9600)
+    original = session._serial
+    session._serial = _BaudRejectingSerial(original, fail_rate=333333, exc=exc)
+    try:
+        with pytest.raises(SessionError) as e:
+            session.scan_baud((9600, 333333, 115200), 0.1, no_op_decide)
+        assert "333333" in str(e.value)
+
+        # Restored, not left at an undefined rate with a stale self.baud.
+        assert session.baud == 9600
+        assert original.baudrate == 9600
+        # A bad candidate value is not a device fault -- the session must
+        # stay healthy.
+        assert session.alive is True
+        assert session.death_reason is None
+        # The gap was still real: the reader really was paused.
+        assert manager.status()["capture_gap_count"] == 1
+    finally:
+        session._serial = original
+
+    # The port still works: capture resumes, and a later write goes through.
+    pty.send(b"still healthy\r\n")
+    until(lambda: b"still healthy" in session.buffer.read(0)[0],
+          what="capture to resume after the restore")
+
+
 def test_scan_baud_restores_the_original_rate_when_there_is_no_winner(manager, pty):
     session = open_ok(manager, pty, baud=9600)
     result = session.scan_baud((9600, 115200), 0.1, no_op_decide)
@@ -1320,34 +1470,115 @@ def test_scan_baud_restores_the_original_rate_when_there_is_no_winner(manager, p
     assert session._serial.baudrate == 9600
 
 
+def test_only_the_scanning_thread_calls_port_read_while_paused(manager, pty):
+    """The deterministic version of the invariant below.
+
+    Racing real bytes through a pty is not a reliable discriminator either
+    way (see the next test's docstring) -- a race can go either way run to
+    run. WHO calls `port.read()` while `_scan_pause` is set is not racy at
+    all: it does not depend on any byte actually arriving, only on which
+    thread is making the call, which is exactly the mechanism the pause
+    handshake exists to control.
+    """
+    session = open_ok(manager, pty)
+    real_read = session._serial.read
+    callers_while_paused: list[threading.Thread] = []
+    lock = threading.Lock()
+
+    def spy(*args, **kwargs):
+        if session._scan_pause.is_set():
+            with lock:
+                callers_while_paused.append(threading.current_thread())
+        return real_read(*args, **kwargs)
+
+    session._serial.read = spy
+
+    scan_thread: dict = {}
+
+    def run_scan():
+        scan_thread["value"] = threading.current_thread()
+        session.scan_baud((9600, 115200, 230400), 0.15, no_op_decide)
+
+    thread = threading.Thread(target=run_scan, daemon=True)
+    thread.start()
+    thread.join(DEADLINE)
+
+    assert callers_while_paused, "no read() calls observed during the scan; proves nothing"
+    culprits = {t.name for t in callers_while_paused if t is not scan_thread["value"]}
+    assert not culprits, (
+        f"port.read() was called by {culprits} while the scan believed it "
+        "held the port alone -- the reader thread did not actually park"
+    )
+
+
 def test_scan_baud_samples_never_reach_the_capture_buffer(manager, pty):
     """The invariant the whole coordination design exists for.
 
-    A byte sent while the scan is paused-and-sampling must show up in the
-    scan's OWN samples, never in the session's continuous capture -- even
-    though on a pty it is trivially "readable" at every rate, since a pty has
-    no real UART framing to make a wrong rate produce garbage.
+    NOT provable with a single racy send: the scan's first `reset_input_buffer()`
+    can destroy a one-shot marker before either thread would have seen it,
+    which makes a post-hoc `head == 0` check pass whether or not the pause
+    actually held -- confirmed by mutating `_read_forever` to ack the pause
+    and then keep reading and appending anyway: of three runs, one passed
+    outright and the other two failed only on the secondary "did the marker
+    arrive in samples" assertion, never on `head == 0` itself.
+
+    Sending CONTINUOUSLY for the whole scan and polling `buffer.head`
+    CONTINUOUSLY removes the race: a mutant reader that keeps appending has
+    the whole scan duration, not one instant, to be caught growing `head`,
+    and the property asserted (head never exceeds its value at the moment
+    the reader parked) does not depend on who wins any single read.
     """
     session = open_ok(manager, pty, baud=9600)
-    assert session.buffer.head == 0
 
-    def send_during_scan():
-        until(lambda: session._scan_parked.is_set(),
-              what="the reader to park for the scan")
-        pty.send(b"scanned bytes\r\n")
+    stop_sender = threading.Event()
 
-    sender = threading.Thread(target=send_during_scan, daemon=True)
-    sender.start()
+    def sender():
+        while not stop_sender.is_set():
+            try:
+                pty.send(b"x" * 64)
+            except OSError:
+                return
+            time.sleep(0.005)
 
-    result = session.scan_baud((9600, 115200), 0.3, no_op_decide)
-    sender.join(DEADLINE)
+    sender_thread = threading.Thread(target=sender, daemon=True)
+    sender_thread.start()
 
-    assert session.buffer.head == 0, (
-        "bytes sent while the scan held the port reached the capture buffer "
-        "-- a scan sample would be indistinguishable from real target output"
+    scan_result: dict = {}
+    scan_done = threading.Event()
+
+    def run_scan():
+        scan_result["value"] = session.scan_baud(
+            (9600, 115200, 230400), 0.3, no_op_decide)
+        scan_done.set()
+
+    scanner_thread = threading.Thread(target=run_scan, daemon=True)
+    scanner_thread.start()
+    until(lambda: session._scan_parked.is_set(), what="the reader to park")
+    # Safe to read: the reader's own last append (if any) happened-before it
+    # set `_scan_parked`, so this is a true upper bound from this instant on.
+    head_at_park = session.buffer.head
+
+    observed_heads = []
+    while not scan_done.is_set():
+        observed_heads.append(session.buffer.head)
+        time.sleep(0.01)
+
+    stop_sender.set()
+    sender_thread.join(DEADLINE)
+    scanner_thread.join(DEADLINE)
+
+    assert observed_heads, "the poll loop never ran; this test proves nothing"
+    assert max(observed_heads) == head_at_park, (
+        f"buffer.head grew from {head_at_park} to {max(observed_heads)} while "
+        "the scan believed it was the only thing reading the port"
     )
-    all_sampled = b"".join(result["samples"].values())
-    assert b"scanned bytes" in all_sampled
+    assert session.buffer.head == head_at_park
+
+    total_sampled = sum(len(v) for v in scan_result["value"]["samples"].values())
+    assert total_sampled > 0, (
+        "the continuous sender never got any bytes into the scan's own "
+        "samples either -- this test would prove nothing"
+    )
 
 
 def test_reader_resumes_capturing_after_the_scan_ends(manager, pty):

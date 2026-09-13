@@ -87,6 +87,22 @@ class BaudScanError(RuntimeError):
     """A scan request was refused before the port was ever touched."""
 
 
+MAX_BAUD_RATE = 4_000_000
+"""Ceiling for a caller-supplied rate list.
+
+pyserial's custom-baud path stores the rate in a C `int` (`array('i')`) on
+Linux: a rate at or above 2**31 raises `OverflowError` from inside termios
+rather than refusing cleanly, and a rate the kernel rejects for the specific
+chip is converted to `ValueError`, not `SerialException` -- neither is a
+failure `scan_baud` can safely leave unhandled from a tier-low,
+never-prompted tool whose `rates` argument is an unconstrained integer
+array. 4 Mbaud is comfortably above every real UART console speed (the
+highest `DEFAULT_RATES` candidate is 921 600) and comfortably below the
+overflow boundary, so this rejects the class of input that reaches it
+without rejecting anything a real board could plausibly use.
+"""
+
+
 def sanitize_rates(rates) -> tuple[int, ...]:
     """`DEFAULT_RATES` when the caller supplies nothing; otherwise filtered.
 
@@ -101,7 +117,9 @@ def sanitize_rates(rates) -> tuple[int, ...]:
     cleaned: list[int] = []
     seen: set[int] = set()
     for r in rates:
-        if not isinstance(r, int) or isinstance(r, bool) or r <= 0:
+        if not isinstance(r, int) or isinstance(r, bool):
+            continue
+        if not (0 < r <= MAX_BAUD_RATE):
             continue
         if r in seen:
             continue
@@ -111,7 +129,8 @@ def sanitize_rates(rates) -> tuple[int, ...]:
         raise BaudScanError(
             f"no usable candidate rates in {rates!r}: every value was "
             "non-positive (0 is refused -- POSIX reads it as 'deassert the "
-            "modem control lines', which drops DTR/RTS) or not an integer"
+            f"modem control lines', which drops DTR/RTS), above the "
+            f"{MAX_BAUD_RATE} ceiling, or not an integer"
         )
     return tuple(cleaned)
 

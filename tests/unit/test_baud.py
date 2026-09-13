@@ -4,8 +4,8 @@ from __future__ import annotations
 import pytest
 
 from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_RATES,
-                                    GROUND_CROSSOVER_HINT, all_silent,
-                                    check_budget, pick_winner,
+                                    GROUND_CROSSOVER_HINT, MAX_BAUD_RATE,
+                                    all_silent, check_budget, pick_winner,
                                     rank_candidates, sanitize_rates,
                                     score_sample)
 
@@ -65,6 +65,19 @@ def test_sanitize_rates_refuses_when_nothing_usable_remains():
     with pytest.raises(BaudScanError) as e:
         sanitize_rates([0, -5, True])
     assert "0" in str(e.value) or "no usable" in str(e.value)
+
+
+def test_sanitize_rates_drops_a_rate_above_the_ceiling():
+    # Reproduces the review's finding: pyserial's custom-baud path stores the
+    # rate in a C int (array('i')), which overflows for anything >= 2**31,
+    # and a caller-supplied `rates` array is otherwise unconstrained.
+    assert sanitize_rates([9600, 2_147_483_648, 115200]) == (9600, 115200)
+    assert sanitize_rates([MAX_BAUD_RATE, MAX_BAUD_RATE + 1]) == (MAX_BAUD_RATE,)
+
+
+def test_sanitize_rates_refuses_when_only_over_ceiling_values_remain():
+    with pytest.raises(BaudScanError):
+        sanitize_rates([2_147_483_648, MAX_BAUD_RATE + 1])
 
 
 # --------------------------------------------------------------------------
