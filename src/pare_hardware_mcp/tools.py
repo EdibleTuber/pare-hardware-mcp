@@ -92,11 +92,20 @@ def _read_limit(limit: int | None) -> int:
     MB and 514 ms. `remaining`/`next_cursor` already let a caller drain across
     several calls, so a ceiling costs nothing that was not already supported.
 
-    A non-integer `limit` is refused rather than clamped: `min("4096", n)`
-    raises `TypeError`, which no caller-facing except clause here catches, so
-    it would escape the `{"error": ...}` contract as an opaque transport
-    failure. The input schema says integer, but this worker's bind address is
-    its only access control -- the schema is not a guarantee.
+    A non-integer `limit` is refused rather than clamped, because
+    `min("4096", n)` raises `TypeError` and no caller-facing except clause in
+    `console_read` catches it -- it would escape the `{"error": ...}` contract
+    as an opaque transport failure.
+
+    That is defence in depth, not a reachable wire bug, and the difference was
+    checked rather than assumed: driving `console_read` through `build_server()
+    .call_tool` shows FastMCP's pydantic model validating `limit` first. It
+    COERCES `"4096"`, `4096.0` and even `True` to an int, and rejects `4096.5`
+    with its own ToolError before this function is reached, so over the wire
+    `limit` is always a real int or never arrives. The guard exists for
+    in-process callers (this module's own tests among them) and for any future
+    dispatch path that does not validate, which is exactly the kind of
+    assumption that should not be load-bearing in a handler.
     """
     if limit is None:
         return DEFAULT_READ_LIMIT

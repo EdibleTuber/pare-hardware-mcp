@@ -219,7 +219,14 @@ async def test_a_bounded_read_still_drains_completely_via_next_cursor(big):
 async def test_a_non_integer_limit_is_an_error_not_a_transport_failure(live):
     """Catches `min(limit, ...)` on a non-int: TypeError is not caught by the
     handler's `except KeyError`/`except CursorError`, so it escapes the
-    {"error": ...} contract entirely."""
+    {"error": ...} contract entirely.
+
+    This pins the HANDLER's contract, not the wire's. FastMCP's pydantic model
+    validates `limit` before dispatch (verified against `build_server()
+    .call_tool`: it coerces "4096"/4096.0/True to an int and rejects 4096.5
+    itself), so the wire cannot deliver a string here today -- see
+    `_read_limit`'s docstring.
+    """
     live.current.buffer.append(b"hello")
     out = json.loads(await tools.console_read(
         session="s-1", cursor=0, limit="4096"))
