@@ -14,6 +14,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 
+from pare_hardware_mcp.baud import DEFAULT_SCAN_BUDGET_SECONDS
 from pare_hardware_mcp.ringbuffer import DEFAULT_CAPACITY
 
 
@@ -29,9 +30,12 @@ class Config:
     # the check -- the point is that an OPERATOR declares it out of band.
     expect_serial: str | None = None
     # PARE_HW_REQUEST_DEADLINE_S: the deadline `console_detect_baud` checks its
-    # scan budget (len(rates) * sample_seconds) against before touching the
-    # port, refusing a candidate list that would run past it rather than
-    # discovering the overrun as a transport-level timeout. This worker is
+    # scan budget (`scan_budget_s` below -- a wall-clock budget the sweep
+    # spends, NOT a per-candidate cost that grows with the rate list)
+    # against before touching the port, refusing a scan that would
+    # run past it rather than discovering the overrun as a transport-level
+    # timeout. A candidate list too long to sweep even once is refused by the
+    # same check, against the budget rather than against this. This worker is
     # still declared `transport: stdio` in workers.yaml (see the module
     # docstring), so there is no real `read_timeout` to read yet -- 60
     # matches the `read_timeout` already used by another networked worker's
@@ -39,6 +43,24 @@ class Config:
     # invented number. An operator overrides it once the hardware worker
     # itself is networked and has its own `read_timeout` declared.
     request_deadline_s: float = 60.0
+    # PARE_HW_SCAN_BUDGET_S: total wall time one `console_detect_baud` spends
+    # sampling, across all sweeps. The default is what the sweep design says
+    # catching a boot burst takes (baud.DEFAULT_SCAN_BUDGET_SECONDS), and
+    # lowering it buys a scan that fits a tight deadline at the cost of
+    # fewer sweeps -- less chance of a burst landing in any candidate's
+    # window, which is the whole point of sweeping.
+    #
+    # It is an OPERATOR lever and deliberately not a tool argument, for the
+    # same reason `expect_serial` is not: the caller is a language model,
+    # and a model asked to "detect the baud rate quickly" would shorten the
+    # budget and get back exactly the lucky-window ranking the sweep exists
+    # to replace. It lives here because the conflict it resolves is between
+    # two things only an operator sets -- this and
+    # PARE_HW_REQUEST_DEADLINE_S. Before it existed, an operator whose
+    # deadline was under the fixed 12s budget could not scan at all and had
+    # no lever of any kind: the rate list no longer affects the budget, so
+    # passing fewer rates did not help either.
+    scan_budget_s: float = DEFAULT_SCAN_BUDGET_SECONDS
     # PARE_HW_ARTIFACT_ROOT: the directory `bench_status` inspects for
     # presence, writability and a `.bench-store-id` drive id. Not opened,
     # written to, or otherwise dispatched against by phase 1 -- artifacts are
@@ -84,6 +106,8 @@ def load_config() -> Config:
         expect_serial=os.environ.get("PARE_HW_EXPECT_SERIAL") or None,
         request_deadline_s=_positive_float_env(
             "PARE_HW_REQUEST_DEADLINE_S", 60.0),
+        scan_budget_s=_positive_float_env(
+            "PARE_HW_SCAN_BUDGET_S", DEFAULT_SCAN_BUDGET_SECONDS),
         artifact_root=os.environ.get("PARE_HW_ARTIFACT_ROOT") or None,
         buffer_bytes=_positive_int_env(
             "PARE_HW_BUFFER_BYTES", DEFAULT_CAPACITY),
