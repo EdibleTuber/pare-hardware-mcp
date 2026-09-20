@@ -39,6 +39,13 @@ Environment=AGENT_WORKER_PORT=9102
 Environment=PARE_HW_DEVICE=/dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if01-port0
 Environment=PARE_HW_EXPECT_SERIAL=TG1119e7
 Environment=PYTHONUNBUFFERED=1
+# pare-worker-kit's HTTP request-audit log defaults to
+# $HOME/.local/state/pare-worker/requests.log, which ProtectHome=true below
+# would block -- and that write failure is warn-only (serve.py logs and
+# continues), so the service would start clean while silently losing its
+# only audit trail for HTTP tool calls. Point it at the StateDirectory=
+# below instead.
+Environment=AGENT_WORKER_REQUEST_LOG=/var/lib/pare-hardware-mcp/requests.log
 Restart=on-failure
 RestartSec=5
 
@@ -54,11 +61,16 @@ ReadOnlyPaths=/opt/pare/hardware-mcp
 # device node is openable. DeviceAllow narrows the /dev exposure.
 DevicePolicy=closed
 DeviceAllow=char-ttyUSB rw
-# tailscaled's AF_UNIX socket needs write to /run/tailscale (see the
-# reference unit's comment on why -- connect() needs write on the inode).
-# The leading `-` makes it optional so the unit still starts if the dir
-# isn't there yet at first boot.
-ReadWritePaths=-/run/tailscale
+# Creates /var/lib/pare-hardware-mcp/ owned by pare, writable even under
+# ProtectSystem=strict, and persistent across restarts/reboots -- the
+# systemd-native hole for the audit log above, instead of relaxing the
+# hardening block.
+StateDirectory=pare-hardware-mcp
+# No ReadWritePaths for /run/tailscale: the worker's interface-address
+# lookup (pare_worker_kit.serve._interface_address) uses SIOCGIFADDR, an
+# ioctl on a UDP socket -- it never touches tailscaled's control socket.
+# The reference unit needed /run/tailscale because it shells out to
+# `tailscale status`; this worker doesn't.
 
 [Install]
 WantedBy=multi-user.target
