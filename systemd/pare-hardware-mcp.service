@@ -1,0 +1,76 @@
+# Networked hardware MCP worker on pare-bench. Serves streamable_http on
+# tailscale0:9102 -- the bind address is the trust boundary
+# (pare-worker-kit refuses 0.0.0.0). PARE's daemon dispatches through
+# /etc/pare/workers.yaml's hardware: entry.
+#
+# Install:  sudo cp systemd/pare-hardware-mcp.service /etc/systemd/system/
+#           sudo systemctl daemon-reload
+#           sudo systemctl enable --now pare-hardware-mcp
+#
+# Depends on hardware: /dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if01-port0
+# must be present for the worker's console tools to open a session -- but the
+# worker itself starts regardless and reports the honest error at tool time.
+
+[Unit]
+Description=PARE hardware MCP worker (Tigard UART / JTAG / glitch)
+# network.target only, NOT network-online.target: the worker binds
+# tailscale0 which will exist as soon as tailscaled is up; we don't want
+# to block on external reachability that may never come.
+After=network.target tailscaled.service
+Wants=tailscaled.service
+
+# A crash loop must not silently disappear the worker. Matches
+# pare-bench-status.service's reasoning -- StartLimitBurst=5 would give
+# up after five restarts and PARE's daemon would see connect-refused
+# with no signal from the Pi about why.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pare
+Group=pare
+# dialout for /dev/ttyUSB* access (verified 2026-09-18 on pare-bench).
+SupplementaryGroups=dialout
+WorkingDirectory=/opt/pare/hardware-mcp
+ExecStart=/opt/pare/hardware-mcp/.venv/bin/pare-hardware-mcp
+Environment=AGENT_WORKER_TRANSPORT=http
+Environment=AGENT_WORKER_HOST=tailscale0
+Environment=AGENT_WORKER_PORT=9102
+Environment=PARE_HW_DEVICE=/dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if01-port0
+Environment=PARE_HW_EXPECT_SERIAL=TG1119e7
+Environment=PYTHONUNBUFFERED=1
+# pare-worker-kit's HTTP request-audit log defaults to
+# $HOME/.local/state/pare-worker/requests.log, which ProtectHome=true below
+# would block -- and that write failure is warn-only (serve.py logs and
+# continues), so the service would start clean while silently losing its
+# only audit trail for HTTP tool calls. Point it at the StateDirectory=
+# below instead.
+Environment=AGENT_WORKER_REQUEST_LOG=/var/lib/pare-hardware-mcp/requests.log
+Restart=on-failure
+RestartSec=5
+
+# Least privilege. The worker opens a TCP listen socket and reads/writes
+# a specific /dev/ttyUSB* character device -- nothing else on the box
+# should be reachable from a compromised worker process.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/opt/pare/hardware-mcp
+# /dev needs a specific carve-out so udev symlinks resolve and the ttyUSB
+# device node is openable. DeviceAllow narrows the /dev exposure.
+DevicePolicy=closed
+DeviceAllow=char-ttyUSB rw
+# Creates /var/lib/pare-hardware-mcp/ owned by pare, writable even under
+# ProtectSystem=strict, and persistent across restarts/reboots -- the
+# systemd-native hole for the audit log above, instead of relaxing the
+# hardening block.
+StateDirectory=pare-hardware-mcp
+# No ReadWritePaths for /run/tailscale: the worker's interface-address
+# lookup (pare_worker_kit.serve._interface_address) uses SIOCGIFADDR, an
+# ioctl on a UDP socket -- it never touches tailscaled's control socket.
+# The reference unit needed /run/tailscale because it shells out to
+# `tailscale status`; this worker doesn't.
+
+[Install]
+WantedBy=multi-user.target
