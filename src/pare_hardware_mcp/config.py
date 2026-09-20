@@ -35,12 +35,7 @@ class Config:
     # against before touching the port, refusing a scan that would
     # run past it rather than discovering the overrun as a transport-level
     # timeout. A candidate list too long to sweep even once is refused by the
-    # same check, against the budget rather than against this. This worker is
-    # still declared `transport: stdio` in workers.yaml (see the module
-    # docstring), so there is no real `read_timeout` to read yet -- 60
-    # matches the `read_timeout` already used by another networked worker's
-    # entry there (frida), so this tracks a real precedent rather than an
-    # invented number. An operator overrides it once the hardware worker
+    # same check, against the budget rather than against this. As of 2026-09-20 this worker is declared `transport: streamable_http` in PARE's `workers.yaml` and has its own `read_timeout: 60` declared there — that number is the operator's authority; this default is a local fallback when the worker is exercised out of process (tests, manual runs). See PARE `docs/superpowers/specs/2026-09-20-bench-integration-design.md` §4-5. An operator overrides it once the hardware worker
     # itself is networked and has its own `read_timeout` declared.
     request_deadline_s: float = 60.0
     # PARE_HW_SCAN_BUDGET_S: total wall time one `console_detect_baud` spends
