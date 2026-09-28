@@ -172,3 +172,129 @@ def test_power_tools_are_registered_at_risk_tier_high():
     for name in ("power_status", "power_set", "power_cycle"):
         assert name in tiers, name
         assert tiers[name] == "high", name
+
+
+async def test_power_status_relay_error_becomes_an_err_not_a_crash(monkeypatch):
+    fake = FakeRelayController(raise_exc=RelayError("relay is unreachable"))
+    _patch_controller(monkeypatch, fake)
+
+    out = json.loads(await tools.power_status())
+
+    assert "error" in out
+    assert "relay is unreachable" in out["error"]
+
+
+# -- Fix round 1, Finding 1: no AT protocol string ever reaches a caller ----
+
+
+class _NoOkReplySerial:
+    """A fake relay port that never replies OK -- drives the REAL
+    RelayController through its actual `_at()` failure path, so this
+    exercises the real sanitization in relay.py rather than a handler-level
+    stand-in for it."""
+
+    def write(self, data: bytes) -> None:
+        pass
+
+    def flush(self) -> None:
+        pass
+
+    def reset_input_buffer(self) -> None:
+        pass
+
+    def read_until(self, expected: bytes = b"\n", size=None) -> bytes:
+        return b""  # empty reply: not OK, so _at() raises RelayError
+
+    def close(self) -> None:
+        pass
+
+
+def _patch_real_relay_controller(monkeypatch, controller):
+    """Like `_patch_controller`, but hands the handler a REAL
+    `RelayController` (built against a fake serial port) instead of the
+    hand-rolled `FakeRelayController` -- needed to prove the sanitization
+    lives in `relay.py` and survives all the way to the handler's `_err`."""
+    monkeypatch.setattr(tools, "CONFIG", RELAY_CONFIGURED)
+    monkeypatch.setattr(tools, "RelayController",
+                        type("_F", (), {"from_config": staticmethod(lambda cfg: controller)}))
+
+
+async def test_power_set_error_never_leaks_the_raw_at_command(monkeypatch):
+    from pare_hardware_mcp.relay import RelayController as RealRelayController
+    real = RealRelayController("/dev/ttyUSB-relay", 1, "nc",
+                               serial_factory=lambda dev: _NoOkReplySerial())
+    _patch_real_relay_controller(monkeypatch, real)
+
+    out = json.loads(await tools.power_set("on"))
+
+    assert "error" in out
+    # The wire protocol must never reach the caller (spec design line 67).
+    assert "AT+CH" not in out["error"]
+    assert "AT" not in out["error"].split()  # no bare "AT" token either
+    # The underlying reason and device are still there in plain terms.
+    assert "no ok reply" in out["error"].lower()
+    assert "/dev/ttyUSB-relay" in out["error"]
+
+
+async def test_power_cycle_error_never_leaks_the_raw_at_command(monkeypatch):
+    from pare_hardware_mcp.relay import RelayController as RealRelayController
+    real = RealRelayController("/dev/ttyUSB-relay", 1, "nc",
+                               serial_factory=lambda dev: _NoOkReplySerial())
+    _patch_real_relay_controller(monkeypatch, real)
+
+    out = json.loads(await tools.power_cycle())
+
+    assert "error" in out
+    assert "AT+CH" not in out["error"]
+
+
+async def test_power_status_error_never_leaks_the_raw_at_command(monkeypatch):
+    from pare_hardware_mcp.relay import RelayController as RealRelayController
+    real = RealRelayController("/dev/ttyUSB-relay", 1, "nc",
+                               serial_factory=lambda dev: _NoOkReplySerial())
+    _patch_real_relay_controller(monkeypatch, real)
+
+    out = json.loads(await tools.power_status())
+
+    assert "error" in out
+    assert "AT+CH" not in out["error"]
+
+
+# -- Fix round 1, Finding 2: a present-but-invalid polarity must not raise --
+
+
+async def test_power_status_with_invalid_polarity_is_a_clean_error_not_a_crash(monkeypatch):
+    # relay_device/channel/polarity are all PRESENT, so from_config does not
+    # raise RelayNotConfigured -- the bad polarity only surfaces once
+    # RelayController.__init__ validates it, as a plain RelayError. The
+    # handler must catch that too, not just RelayNotConfigured.
+    monkeypatch.setattr(tools, "CONFIG", Config(
+        relay_device="/dev/ttyUSB-relay", relay_channel=1,
+        relay_polarity="bogus"))
+
+    out = json.loads(await tools.power_status())
+
+    assert "error" in out
+    assert "polarity" in out["error"].lower()
+
+
+async def test_power_set_with_invalid_polarity_is_a_clean_error_not_a_crash(monkeypatch):
+    monkeypatch.setattr(tools, "CONFIG", Config(
+        relay_device="/dev/ttyUSB-relay", relay_channel=1,
+        relay_polarity="bogus"))
+
+    out = json.loads(await tools.power_set("on"))
+
+    assert "error" in out
+    assert "polarity" in out["error"].lower()
+
+
+async def test_power_cycle_with_invalid_polarity_is_a_clean_error_not_a_crash(monkeypatch):
+    monkeypatch.setattr(tools, "CONFIG", Config(
+        relay_device="/dev/ttyUSB-relay", relay_channel=1,
+        relay_polarity="bogus"))
+
+    out = json.loads(await tools.power_cycle())
+
+    assert "error" in out
+    assert "polarity" in out["error"].lower()

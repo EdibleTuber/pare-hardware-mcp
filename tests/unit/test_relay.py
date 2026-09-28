@@ -106,6 +106,37 @@ def test_garbage_reply_is_an_error_not_a_silent_success():
         r.set_power("off")
 
 
+# -- Fix round 1, Finding 1: safe_message never carries the wire protocol ---
+
+def test_bad_reply_safe_message_omits_the_at_command_but_keeps_the_reason():
+    fake = FakeRelaySerial(replies={"AT+CH1=1\r\n": b""})
+    r = RelayController("/dev/relay", 1, "nc", serial_factory=lambda dev: fake)
+    with pytest.raises(RelayError) as e:
+        r.set_power("off")
+    # str(exc) is the full diagnostic and MAY name the raw command --
+    # that's the log line, never the tool reply.
+    assert "AT+CH1=1" in str(e.value)
+    # safe_message is what a handler must return: same reason, no protocol.
+    assert "AT+CH" not in e.value.safe_message
+    assert "/dev/relay" in e.value.safe_message
+    assert "no ok reply" in e.value.safe_message.lower()
+
+
+def test_serial_failure_safe_message_omits_the_at_command_but_keeps_the_reason():
+    fake = FakeRelaySerial()
+
+    def failing_write(data):
+        raise serial.SerialException("timeout")
+    fake.write = failing_write
+    r = RelayController("/dev/relay", 1, "nc", serial_factory=lambda dev: fake)
+    with pytest.raises(RelayError) as e:
+        r.set_power("off")
+    assert "AT+CH1=1" in str(e.value)
+    assert "AT+CH" not in e.value.safe_message
+    assert "timeout" in e.value.safe_message
+    assert "/dev/relay" in e.value.safe_message
+
+
 def test_empty_reply_is_an_error_not_a_silent_success():
     fake = FakeRelaySerial(replies={"AT+CH1=1\r\n": b""})
     r = RelayController("/dev/relay", 1, "nc", serial_factory=lambda dev: fake)

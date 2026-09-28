@@ -50,7 +50,20 @@ class RelayError(RuntimeError):
     Never a raw `serial.SerialException` or a silently-swallowed bad reply --
     both are converted here so a caller (or a language model) sees one
     exception family for "the relay didn't do what we asked."
+
+    `str(exc)` is the full diagnostic message and MAY name the raw AT
+    command (`AT+CHn=...`) -- fine for a log line, never fine for a tool
+    reply. `safe_message` is what a handler must return instead: the same
+    underlying reason (a timeout, "no OK reply", the device path) with the
+    wire protocol never spoken (spec design line 67: "tools speak target
+    power on/off; a caller never sees AT+CHn="). It defaults to the full
+    message for the error paths that never mention the protocol in the
+    first place (bad polarity, bad state, a device that would not open).
     """
+
+    def __init__(self, message: str, *, safe_message: str | None = None):
+        super().__init__(message)
+        self.safe_message = message if safe_message is None else safe_message
 
 
 class RelayNotConfigured(RelayError):
@@ -137,7 +150,10 @@ class RelayController:
         Write discipline: `f"{cmd}\\r\\n"`. A reply that is empty, garbled,
         or that a serial-level failure prevents from arriving is a
         `RelayError` naming the command and (when there is a reply) the raw
-        bytes -- never a silent success.
+        bytes -- never a silent success. Both messages carry the raw
+        command in `str(exc)` for diagnostics only; `safe_message` gives a
+        caller the same underlying reason (the serial exception text, or
+        "no OK reply") and the device path without ever spelling `AT+CHn=`.
         """
         try:
             port.reset_input_buffer()
@@ -146,13 +162,20 @@ class RelayController:
             raw = port.read_until(b"\x00")
         except serial.SerialException as exc:
             raise RelayError(
-                f"relay command {cmd!r} to {self._device} failed: {exc}"
+                f"relay command {cmd!r} to {self._device} failed: {exc}",
+                safe_message=(
+                    f"relay command to {self._device} failed: {exc}"),
             ) from exc
         text = raw.decode("ascii", errors="replace").strip("\x00").strip()
         if not text.startswith("OK"):
             raise RelayError(
                 f"relay command {cmd!r} to {self._device} got an "
-                f"unexpected reply: {raw!r}")
+                f"unexpected reply: {raw!r}",
+                safe_message=(
+                    f"relay at {self._device} did not confirm the command "
+                    "(no OK reply) -- it may be disconnected or "
+                    "misconfigured"),
+            )
         return text
 
     def _run(self, cmd: str) -> str:

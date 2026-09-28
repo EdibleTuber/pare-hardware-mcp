@@ -631,16 +631,40 @@ async def bench_status() -> str:
     )
 
 
-def _relay_controller() -> RelayController:
-    """`RelayController.from_config(CONFIG)`, read as module globals.
+_NO_RELAY_MSG = (
+    "no relay is configured for this bench: set PARE_HW_RELAY_DEVICE, "
+    "PARE_HW_RELAY_CHANNEL and PARE_HW_RELAY_POLARITY"
+)
 
-    Both `RelayController` and `CONFIG` are looked up at call time (not
-    captured into a local at import time), which is what lets tests replace
-    either one with `monkeypatch.setattr(tools, ...)` -- the same seam
-    `bench_status`'s `MANAGER`/`list_serial_devices` and `console_detect_baud`'s
-    `_manager_current` already rely on.
+
+def _resolve_relay() -> tuple[RelayController | None, str | None]:
+    """`RelayController.from_config(CONFIG)`, or a ready-to-return `_err`.
+
+    `RelayController` and `CONFIG` are looked up at call time (not captured
+    into a local at import time), which is what lets tests replace either
+    one with `monkeypatch.setattr(tools, ...)` -- the same seam
+    `bench_status`'s `MANAGER`/`list_serial_devices` and
+    `console_detect_baud`'s `_manager_current` already rely on.
+
+    `RelayNotConfigured` (no relay declared for this bench) is caught
+    BEFORE the plain `RelayError` it subclasses, so this is not the usual
+    "subclass shadows base" bug -- it is the reverse: `from_config` only
+    validates presence, and a PRESENT but invalid `relay_polarity` reaches
+    `RelayController.__init__` (relay.py) and raises a bare `RelayError`
+    there. Production `load_config` validates polarity before it ever
+    reaches here, but "never raises out of the handler" is a guarantee
+    about this function, not about what callers happen to pass -- and the
+    tests construct `Config(...)` directly, bypassing that validation. Both
+    branches return `exc.safe_message`/the fixed message rather than
+    `str(exc)`: neither may ever contain a raw `AT+CHn=` string (spec
+    design line 67).
     """
-    return RelayController.from_config(CONFIG)
+    try:
+        return RelayController.from_config(CONFIG), None
+    except RelayNotConfigured:
+        return None, _err(_NO_RELAY_MSG)
+    except RelayError as exc:
+        return None, _err(exc.safe_message)
 
 
 async def power_status() -> str:
@@ -650,20 +674,16 @@ async def power_status() -> str:
     than split by read/write, since a status query still requires opening
     the relay's serial port and any relay tool touching a live bench target
     warrants the same operator gate. Never raises out of the handler --
-    `RelayNotConfigured` and `RelayError` both become an `_err`.
+    `RelayNotConfigured` and `RelayError` both become an `_err`, and neither
+    ever carries the raw AT command (`exc.safe_message`, not `str(exc)`).
     """
-    try:
-        relay = _relay_controller()
-    except RelayNotConfigured:
-        return _err(
-            "no relay is configured for this bench: set "
-            "PARE_HW_RELAY_DEVICE, PARE_HW_RELAY_CHANNEL and "
-            "PARE_HW_RELAY_POLARITY"
-        )
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
     try:
         status = await asyncio.to_thread(relay.status)
     except RelayError as exc:
-        return _err(str(exc))
+        return _err(exc.safe_message)
     return _ok(**status)
 
 
@@ -673,20 +693,15 @@ async def power_set(state: str) -> str:
     Off the event loop: `RelayController.set_power` opens a serial port,
     round-trips an AT command and closes it again -- the same blocking-I/O
     rule as every other handler in this module. Never raises out of the
-    handler.
+    handler, and never returns the raw AT command -- see `_resolve_relay`.
     """
-    try:
-        relay = _relay_controller()
-    except RelayNotConfigured:
-        return _err(
-            "no relay is configured for this bench: set "
-            "PARE_HW_RELAY_DEVICE, PARE_HW_RELAY_CHANNEL and "
-            "PARE_HW_RELAY_POLARITY"
-        )
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
     try:
         status = await asyncio.to_thread(relay.set_power, state)
     except RelayError as exc:
-        return _err(str(exc))
+        return _err(exc.safe_message)
     return _ok(**status)
 
 
@@ -697,18 +712,13 @@ async def power_cycle(off_ms: int = 3000) -> str:
     failure mid-cycle leaves the target on rather than stranded off (D7);
     this handler just surfaces whatever that call returns or raises. Off the
     event loop like every other relay call, and never raises out of the
-    handler.
+    handler, and never returns the raw AT command -- see `_resolve_relay`.
     """
-    try:
-        relay = _relay_controller()
-    except RelayNotConfigured:
-        return _err(
-            "no relay is configured for this bench: set "
-            "PARE_HW_RELAY_DEVICE, PARE_HW_RELAY_CHANNEL and "
-            "PARE_HW_RELAY_POLARITY"
-        )
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
     try:
         result = await asyncio.to_thread(relay.power_cycle, off_ms)
     except RelayError as exc:
-        return _err(str(exc))
+        return _err(exc.safe_message)
     return _ok(**result["status"], off_ms_actual=result["off_ms_actual"])
