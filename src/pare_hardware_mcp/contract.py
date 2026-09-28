@@ -98,4 +98,22 @@ TOOL_SPECS: list[ToolSpec] = [
              "Release the port and end the session. The buffer is discarded; "
              "read what you need first.",
              _in(session={"type": "string"})),
+    ToolSpec("power_status", "high",
+             "Current target power state, read from the relay. PINNED high: "
+             "grouped with the other relay tools because any of them "
+             "touches a live bench target's power. Returns an error if no "
+             "relay is configured for this bench.",
+             dict(_OBJ)),
+    ToolSpec("power_set", "high",
+             "Set the target's power via the relay. PINNED high: this "
+             "directly controls power to a live bench target. Returns an "
+             "error if no relay is configured for this bench.",
+             _in(state={"type": "string", "enum": ["on", "off"]})),
+    ToolSpec("power_cycle", "high",
+             "Power off the target, wait `off_ms`, then power it back on -- "
+             "power is ALWAYS restored even if the cycle fails partway. "
+             "PINNED high: this directly controls power to a live bench "
+             "target. Returns an error if no relay is configured for this "
+             "bench.",
+             _in(off_ms={"type": "integer"})),
 ]

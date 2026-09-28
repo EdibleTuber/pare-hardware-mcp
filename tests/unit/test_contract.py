@@ -12,6 +12,7 @@ from pare_hardware_mcp.contract import CONTRACT_VERSION, TOOL_SPECS
 EXPECTED = {
     "list_devices", "bench_status", "console_detect_baud", "console_open",
     "console_read", "console_send", "console_status", "console_close",
+    "power_status", "power_set", "power_cycle",
 }
 
 
@@ -33,12 +34,22 @@ def test_every_tool_advertises_a_valid_tier_and_produces_result():
         assert spec.produces == PRODUCES_RESULT, spec.name
 
 
+_HIGH = {"console_send", "power_status", "power_set", "power_cycle"}
+
+
 def test_send_is_high_and_open_is_medium_and_the_rest_are_low():
     tiers = {s.name: s.risk_tier for s in TOOL_SPECS}
-    assert tiers["console_send"] == "high"
+    for name in _HIGH:
+        assert tiers[name] == "high", name
     assert tiers["console_open"] == "medium"
-    for name in EXPECTED - {"console_send", "console_open"}:
+    for name in EXPECTED - _HIGH - {"console_open"}:
         assert tiers[name] == "low", name
+
+
+def test_power_tools_are_pinned_high():
+    tiers = {s.name: s.risk_tier for s in TOOL_SPECS}
+    for name in ("power_status", "power_set", "power_cycle"):
+        assert tiers[name] == "high", name
 
 
 def test_the_contract_imports_without_pyserial():

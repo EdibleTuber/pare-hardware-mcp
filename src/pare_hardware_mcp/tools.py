@@ -51,6 +51,7 @@ from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_DWELL_SECONDS,
                                     rank_candidates, sanitize_rates)
 from pare_hardware_mcp.config import load_config
 from pare_hardware_mcp.devices import list_serial_devices
+from pare_hardware_mcp.relay import RelayController, RelayError, RelayNotConfigured
 from pare_hardware_mcp.ringbuffer import (CursorError, DEFAULT_READ_LIMIT,
                                           MAX_READ_LIMIT)
 from pare_hardware_mcp.session import SessionError, SessionManager
@@ -628,3 +629,86 @@ async def bench_status() -> str:
             "alive": session_status["alive"],
         },
     )
+
+
+def _relay_controller() -> RelayController:
+    """`RelayController.from_config(CONFIG)`, read as module globals.
+
+    Both `RelayController` and `CONFIG` are looked up at call time (not
+    captured into a local at import time), which is what lets tests replace
+    either one with `monkeypatch.setattr(tools, ...)` -- the same seam
+    `bench_status`'s `MANAGER`/`list_serial_devices` and `console_detect_baud`'s
+    `_manager_current` already rely on.
+    """
+    return RelayController.from_config(CONFIG)
+
+
+async def power_status() -> str:
+    """Current target power state, read from the relay.
+
+    Tier high (see contract.py): grouped with the other relay tools rather
+    than split by read/write, since a status query still requires opening
+    the relay's serial port and any relay tool touching a live bench target
+    warrants the same operator gate. Never raises out of the handler --
+    `RelayNotConfigured` and `RelayError` both become an `_err`.
+    """
+    try:
+        relay = _relay_controller()
+    except RelayNotConfigured:
+        return _err(
+            "no relay is configured for this bench: set "
+            "PARE_HW_RELAY_DEVICE, PARE_HW_RELAY_CHANNEL and "
+            "PARE_HW_RELAY_POLARITY"
+        )
+    try:
+        status = await asyncio.to_thread(relay.status)
+    except RelayError as exc:
+        return _err(str(exc))
+    return _ok(**status)
+
+
+async def power_set(state: str) -> str:
+    """Set the target's power to `state` (`"on"` or `"off"`) via the relay.
+
+    Off the event loop: `RelayController.set_power` opens a serial port,
+    round-trips an AT command and closes it again -- the same blocking-I/O
+    rule as every other handler in this module. Never raises out of the
+    handler.
+    """
+    try:
+        relay = _relay_controller()
+    except RelayNotConfigured:
+        return _err(
+            "no relay is configured for this bench: set "
+            "PARE_HW_RELAY_DEVICE, PARE_HW_RELAY_CHANNEL and "
+            "PARE_HW_RELAY_POLARITY"
+        )
+    try:
+        status = await asyncio.to_thread(relay.set_power, state)
+    except RelayError as exc:
+        return _err(str(exc))
+    return _ok(**status)
+
+
+async def power_cycle(off_ms: int = 3000) -> str:
+    """Off, wait `off_ms` (clamped by the driver), on -- restoring on always.
+
+    `RelayController.power_cycle` restores power in a `finally`, so even a
+    failure mid-cycle leaves the target on rather than stranded off (D7);
+    this handler just surfaces whatever that call returns or raises. Off the
+    event loop like every other relay call, and never raises out of the
+    handler.
+    """
+    try:
+        relay = _relay_controller()
+    except RelayNotConfigured:
+        return _err(
+            "no relay is configured for this bench: set "
+            "PARE_HW_RELAY_DEVICE, PARE_HW_RELAY_CHANNEL and "
+            "PARE_HW_RELAY_POLARITY"
+        )
+    try:
+        result = await asyncio.to_thread(relay.power_cycle, off_ms)
+    except RelayError as exc:
+        return _err(str(exc))
+    return _ok(**result["status"], off_ms_actual=result["off_ms_actual"])
