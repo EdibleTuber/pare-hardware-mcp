@@ -68,6 +68,23 @@ TOOL_SPECS: list[ToolSpec] = [
              "silent line reports no-data-at-any-rate rather than guessing.",
              _in(device={"type": "string"},
                  rates={"type": "array", "items": {"type": "integer"}})),
+    ToolSpec("console_detect_baud_cycling", "high",
+             "Detect the console baud rate of a target whose ONLY output is a "
+             "boot burst -- the case console_detect_baud cannot catch, because "
+             "a burst is milliseconds of wire time and a passive sweep is "
+             "almost never listening when it lands. For each candidate rate "
+             "this sets the open session's line speed, POWER-CYCLES THE TARGET "
+             "via the relay to force a fresh boot, and captures that boot. "
+             "PINNED high: it cycles power to a live bench target. Requires a "
+             "relay configured AND an open, alive session; it does not open or "
+             "close one. Refuses before cycling anything if the worst-case "
+             "wall time (rates x (off_ms + capture_ms)) would exceed the "
+             "worker's scan budget. Returns candidates RANKED WITH SCORES and "
+             "a per-rate boot sample, not a bare verdict.",
+             _in(session={"type": "string"},
+                 rates={"type": "array", "items": {"type": "integer"}},
+                 off_ms={"type": "integer"},
+                 capture_ms={"type": "integer"})),
     ToolSpec("console_open", "medium",
              "Open the console and START CAPTURING. Tier medium because this "
              "is not a read-only act: opening asserts DTR/RTS and many boards "

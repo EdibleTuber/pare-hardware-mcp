@@ -906,6 +906,244 @@ class ConsoleSession:
             "gap": gap_entry,
         }
 
+    def scan_baud_cycling(self, rates: tuple[int, ...], capture_seconds: float,
+                          on_rate, decide) -> dict:
+        """ACTIVE baud sweep: force a fresh boot at each candidate and score it.
+
+        The counterpart to `scan_baud`, and it reuses that method's reader
+        coordination WHOLESALE rather than reimplementing it -- the same
+        `_write_lock` acquisition, the same `_scan_pause`/`_scan_parked`
+        handshake, the same termios rate-set on the held descriptor (never a
+        reopen, which would re-assert DTR and reboot a DTR-wired board), the
+        same by-id disappearance check, the same one-gap-spans-the-whole-scan
+        ledger entry, and the same "leave the port at a KNOWN rate with
+        `self.baud` matching it" restore in the `finally`. What differs is the
+        loop it wraps: `scan_baud` sweeps a chattering line repeatedly WITHOUT
+        transmitting; this makes ONE pass and, before sampling each candidate,
+        calls `on_rate(rate)` -- the caller's hook, which in `tools.py` fires
+        `RelayController.power_cycle`, forcing the target to reboot at that
+        rate so its boot burst can be captured. That is the one thing the
+        passive scan cannot do: a boot burst is milliseconds of wire time and
+        a passive sweep is almost never listening when it lands.
+
+        WHY A SINGLE PASS, NOT A SWEEP. Each candidate costs a real power cycle
+        (seconds of off-time), so revisiting rates the way `scan_baud` does
+        would multiply an already expensive operation. `console_detect_baud_
+        cycling` refuses up front any rate list whose one-pass worst case
+        would not fit the budget, so this method is handed a list it can
+        cycle once.
+
+        READER PARKED FOR THE WHOLE THING, INCLUDING THE CYCLES. `on_rate`
+        runs while the reader is parked and `_write_lock` is held: the relay
+        is a SEPARATE serial device, so a power cycle never touches
+        `self._serial`, and parking means the boot bytes at a candidate rate
+        the target may never actually use cannot leak into the byte-exact
+        capture. The whole span -- every off-time and every capture window --
+        is ONE gap entry, recorded before the loop and finished after it, so a
+        concurrent `console_status`/`console_read` sees the suspension in
+        progress exactly as it does for `scan_baud`.
+
+        `on_rate` is invoked for its effect and its return value is ignored; if
+        it RAISES (a relay that will not answer), the exception propagates
+        after the `finally` blocks have restored the port to a known rate,
+        unparked the reader and released the lock -- it is NOT wrapped as a
+        `SessionError`, because `console_detect_baud_cycling` must catch the
+        relay's own exception type to render its `safe_message` without the AT
+        protocol. `decide`, as in `scan_baud`, is wrapped, because a caller's
+        ranking callback raising is a different failure.
+
+        Same rate validation and same return shape as `scan_baud` (minus the
+        sweep-specific `sweeps`/`early_exit`, plus `cycles`), so `tools.py` can
+        rank the samples with the same `baud` helpers.
+        """
+        if not rates:
+            raise SessionError("scan_baud_cycling: no candidate rates given")
+        if any((not isinstance(r, int)) or isinstance(r, bool)
+               or not (0 < r <= MAX_BAUD_RATE) for r in rates):
+            raise SessionError(
+                f"scan_baud_cycling: refusing rate list {rates!r} -- every "
+                "rate must be a positive integer no greater than "
+                f"{MAX_BAUD_RATE} (0 deasserts the modem control lines; "
+                "pyserial's custom-baud path can raise for anything larger)"
+            )
+
+        acquired = self._write_lock.acquire(timeout=WRITE_DRAIN_TIMEOUT)
+        if not acquired:
+            raise SessionError(
+                f"session {self.id}: could not get exclusive access to the "
+                f"port within {WRITE_DRAIN_TIMEOUT}s (a write is in flight); "
+                "refusing to cycle-scan rather than contend with it"
+            )
+        try:
+            if self._closed or self._closing.is_set():
+                raise SessionError(
+                    f"session {self.id} is closing or closed; refusing to scan"
+                )
+            if not self.alive:
+                raise SessionError(
+                    f"session {self.id} is not alive, refusing to scan: "
+                    f"{self.death_reason}"
+                )
+
+            original_baud = self.baud
+            samples: dict = {}
+            listened: dict[int, float] = {}
+            rejected: dict[int, str] = {}
+            cycles = 0
+            winner: int | None = None
+            # Pre-set to the fallback, as in `scan_baud`: if anything below
+            # raises before a winner is chosen, the `finally` still restores a
+            # KNOWN rate rather than whatever the failed candidate left in the
+            # termios struct.
+            final_baud = original_baud
+            applied_baud = original_baud
+            gap_start_time: float | None = None
+            gap_entry: dict | None = None
+
+            self._scan_pause.set()
+            try:
+                parked = self._scan_parked.wait(timeout=SCAN_PARK_TIMEOUT)
+                if not parked:
+                    raise SessionError(
+                        f"session {self.id}: reader thread did not park "
+                        f"within {SCAN_PARK_TIMEOUT}s; refusing to scan "
+                        "rather than risk two readers on one port"
+                    )
+
+                buffer = self._buffer
+                gap_start_time = time.monotonic()
+                gap_entry = self._record_gap(
+                    at_cursor=buffer.head if buffer is not None else 0,
+                    duration_s=0.0,
+                    reason="baud scan (cycling)",
+                    in_progress=True,
+                )
+
+                try:
+                    for rate in rates:
+                        if self._stop.is_set() or self._closing.is_set():
+                            break
+                        try:
+                            self._serial.baudrate = rate
+                            # Recorded AFTER the assignment that can raise, so
+                            # it only ever names a rate the port really took.
+                            applied_baud = rate
+                            # Discard whatever the PREVIOUS candidate left in
+                            # the driver queue -- framed at a different speed,
+                            # so not evidence about `rate`. Done BEFORE the
+                            # power cycle: during the off-time nothing arrives,
+                            # so the boot burst that follows stays queued for
+                            # the capture window below rather than being
+                            # flushed with the stale bytes.
+                            self._serial.reset_input_buffer()
+                        except (serial.SerialException, OSError) as exc:
+                            self._die(self._explain(
+                                exc, "cycling scan (set rate)"))
+                            raise SessionError(
+                                f"session {self.id}: setting {rate} baud "
+                                f"failed and the device looks gone: "
+                                f"{self.death_reason}"
+                            ) from exc
+                        except (ValueError, OverflowError) as exc:
+                            # Same as `scan_baud`: a rate that passed the
+                            # ceiling check but the specific chip refuses is
+                            # recorded and the next candidate tried, never
+                            # aborting the others' evidence.
+                            rejected[rate] = str(exc)
+                            samples.pop(rate, None)
+                            continue
+
+                        # Force a fresh boot AT THIS RATE. Raises out of the
+                        # method (through the restore `finally`) if the relay
+                        # will not answer -- see the docstring.
+                        on_rate(rate)
+                        cycles += 1
+
+                        collected = bytearray()
+                        capture_start = time.monotonic()
+                        deadline = capture_start + capture_seconds
+                        while (time.monotonic() < deadline
+                               and not self._stop.is_set()
+                               and not self._closing.is_set()):
+                            try:
+                                chunk = self._serial.read(READ_CHUNK)
+                            except (serial.SerialException, OSError) as exc:
+                                self._die(self._explain(
+                                    exc, "cycling scan (read)"))
+                                break
+                            if chunk:
+                                collected.extend(chunk)
+                                continue
+                            # The same two-way ambiguity `scan_baud` resolves:
+                            # an empty window at a candidate rate scores as
+                            # evidence, and an adapter that left the bus must
+                            # not be mistaken for a floating ground.
+                            if not os.path.lexists(self.device.by_id):
+                                self._die(
+                                    f"device {self.device.by_id} disappeared "
+                                    f"during a cycling baud scan at {rate}: "
+                                    f"the by-id path no longer resolves (was "
+                                    f"{self.device.tty}) and the line has gone "
+                                    "quiet"
+                                )
+                                break
+                        samples[rate] = bytes(collected)
+                        listened[rate] = time.monotonic() - capture_start
+                        if not self.alive:
+                            break
+
+                    try:
+                        winner = decide(samples) if samples else None
+                    except Exception as exc:  # noqa: BLE001 -- a 3rd-party
+                        # ranking callback must not escape as anything other
+                        # than SessionError, and must not skip the restore.
+                        raise SessionError(
+                            f"session {self.id}: the cycling baud-scan "
+                            f"decision callback raised: "
+                            f"{type(exc).__name__}: {exc}"
+                        ) from exc
+                    final_baud = winner if winner is not None else original_baud
+                finally:
+                    # Identical discipline to `scan_baud`: leave the port at a
+                    # known rate with `self.baud` matching what the port
+                    # ACCEPTED, trying the winner then the original.
+                    for candidate in dict.fromkeys((final_baud, original_baud)):
+                        try:
+                            self._serial.baudrate = candidate
+                            self._serial.reset_input_buffer()
+                        except Exception:  # noqa: BLE001 -- best effort; the
+                            continue      # device may already be gone
+                        applied_baud = candidate
+                        break
+                    if winner is not None and applied_baud != winner:
+                        # A winner the port is not actually left at is not a
+                        # winner -- reporting one would make the fields
+                        # contradict each other.
+                        winner = None
+                    final_baud = applied_baud
+                    self.baud = applied_baud
+            finally:
+                self._scan_pause.clear()
+                if gap_entry is not None:
+                    self._finish_gap(gap_entry,
+                                     time.monotonic() - gap_start_time)
+        finally:
+            self._write_lock.release()
+
+        return {
+            "samples": samples,
+            "rejected": rejected,
+            "listen_seconds": listened,
+            "cycles": cycles,
+            "original_baud": original_baud,
+            "final_baud": final_baud,
+            "winner": winner,
+            "restored": winner is None,
+            "alive": self.alive,
+            "death_reason": self.death_reason,
+            "gap": gap_entry,
+        }
+
     def _shutdown(self) -> str | None:
         """Stop the reader, release the port, discard the capture.
 

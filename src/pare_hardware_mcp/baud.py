@@ -355,6 +355,32 @@ the whole capture -- this keeps the tool result compact for every candidate
 rate at once rather than only the winner.
 """
 
+DEFAULT_CYCLE_CAPTURE_MS = 2000
+"""How long the cycle-assisted sweep listens after each power cycle.
+
+Unlike the passive sweep -- which listens to a line that is CHATTERING and so
+can revisit each rate many times inside `DEFAULT_SCAN_BUDGET_SECONDS` -- the
+cycling sweep forces exactly one fresh boot per candidate and captures it once.
+A boot burst is milliseconds of wire time but the target keeps talking for a
+second or more after (bootloader banner, early kernel), so this window is sized
+to hold that, not the burst alone. It is deliberately modest because it is
+paid PER CANDIDATE on top of the off-time of a real power cycle: the wall-clock
+budget refusal in `console_detect_baud_cycling` uses this same number, so a
+long window shrinks how many rates fit under the budget rather than silently
+overrunning it.
+"""
+
+CYCLE_MARGIN_S = 0.5
+"""Per-candidate slack in the cycling sweep's worst-case wall-time estimate.
+
+Covers the relay's own AT round-trips (open, off-write, on-write, status,
+close at 9600 baud) and scheduling jitter -- everything the worst case must
+account for BEYOND the off-time and the capture window, so the budget refusal
+never under-counts and lets a scan cycle the target N times only to time out.
+Conservative on purpose: it is cheaper to refuse a scan that would just fit
+than to strand a target through repeated cycles and then abort.
+"""
+
 WINNER_PRINTABLE_THRESHOLD = 0.85
 """How good a candidate's `printable_ratio` must be to be left live.
 
