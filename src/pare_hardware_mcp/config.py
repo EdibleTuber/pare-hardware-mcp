@@ -72,6 +72,19 @@ class Config:
     # observed boot-log volume; an operator with a more talkative target or a
     # tighter memory budget overrides it here.
     buffer_bytes: int = DEFAULT_CAPACITY
+    # PARE_HW_RELAY_DEVICE: by-path device for the DSD TECH SH-UR04A relay
+    # (a second, independent serial adapter from PARE_HW_DEVICE). By-path,
+    # not by-id, because the CP2102 bridge's serial is a generic "0001" --
+    # by-id would be ambiguous with more than one such adapter on the bench.
+    relay_device: str | None = None
+    # PARE_HW_RELAY_CHANNEL: which of the relay's 4 channels (1-4) the
+    # target's power lead is wired to.
+    relay_channel: int | None = None
+    # PARE_HW_RELAY_POLARITY: "nc" (target on = channel idle) or "no"
+    # (target on = channel energised) -- see relay.py's polarity math. An
+    # operator-declared fact about the wiring, not something the worker can
+    # infer.
+    relay_polarity: str | None = None
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -100,6 +113,28 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _ranged_int_env(name: str, low: int, high: int) -> int | None:
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        raise ValueError(f"{name}={raw!r} is not an integer") from None
+    if not (low <= value <= high):
+        raise ValueError(f"{name}={raw!r} must be between {low} and {high}")
+    return value
+
+
+def _relay_polarity_env(name: str) -> str | None:
+    raw = os.environ.get(name) or None
+    if raw is None:
+        return None
+    if raw not in ("nc", "no"):
+        raise ValueError(f"{name}={raw!r} must be 'nc' or 'no'")
+    return raw
+
+
 def load_config() -> Config:
     return Config(
         device=os.environ.get("PARE_HW_DEVICE") or None,
@@ -111,4 +146,7 @@ def load_config() -> Config:
         artifact_root=os.environ.get("PARE_HW_ARTIFACT_ROOT") or None,
         buffer_bytes=_positive_int_env(
             "PARE_HW_BUFFER_BYTES", DEFAULT_CAPACITY),
+        relay_device=os.environ.get("PARE_HW_RELAY_DEVICE") or None,
+        relay_channel=_ranged_int_env("PARE_HW_RELAY_CHANNEL", 1, 4),
+        relay_polarity=_relay_polarity_env("PARE_HW_RELAY_POLARITY"),
     )

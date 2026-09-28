@@ -154,3 +154,72 @@ def test_a_non_positive_buffer_bytes_is_refused(monkeypatch):
     monkeypatch.setenv("PARE_HW_BUFFER_BYTES", "0")
     with pytest.raises(ValueError):
         load_config()
+
+
+# -- relay config -------------------------------------------------------
+
+
+def test_relay_fields_default_to_none_when_unset(monkeypatch):
+    monkeypatch.delenv("PARE_HW_RELAY_DEVICE", raising=False)
+    monkeypatch.delenv("PARE_HW_RELAY_CHANNEL", raising=False)
+    monkeypatch.delenv("PARE_HW_RELAY_POLARITY", raising=False)
+    cfg = load_config()
+    assert cfg.relay_device is None
+    assert cfg.relay_channel is None
+    assert cfg.relay_polarity is None
+
+
+def test_relay_fields_are_read_from_the_environment(monkeypatch):
+    monkeypatch.setenv(
+        "PARE_HW_RELAY_DEVICE",
+        "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0",
+    )
+    monkeypatch.setenv("PARE_HW_RELAY_CHANNEL", "1")
+    monkeypatch.setenv("PARE_HW_RELAY_POLARITY", "nc")
+    cfg = load_config()
+    assert cfg.relay_device == (
+        "/dev/serial/by-path/platform-fd500000.pcie-pci-0000:01:00.0-usb-0:1.1:1.0"
+    )
+    assert cfg.relay_channel == 1
+    assert cfg.relay_polarity == "nc"
+
+
+def test_an_empty_relay_device_env_var_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_DEVICE", "")
+    assert load_config().relay_device is None
+
+
+def test_an_out_of_range_relay_channel_is_rejected(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_CHANNEL", "5")
+    with pytest.raises(ValueError):
+        load_config()
+
+
+def test_a_zero_relay_channel_is_rejected(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_CHANNEL", "0")
+    with pytest.raises(ValueError):
+        load_config()
+
+
+def test_a_non_numeric_relay_channel_is_a_clear_error_not_a_crash(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_CHANNEL", "one")
+    with pytest.raises(ValueError) as e:
+        load_config()
+    assert "one" in str(e.value)
+
+
+def test_an_empty_relay_channel_env_var_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_CHANNEL", "")
+    assert load_config().relay_channel is None
+
+
+def test_a_bad_relay_polarity_is_rejected(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_POLARITY", "backwards")
+    with pytest.raises(ValueError) as e:
+        load_config()
+    assert "backwards" in str(e.value)
+
+
+def test_an_empty_relay_polarity_env_var_is_treated_as_unset(monkeypatch):
+    monkeypatch.setenv("PARE_HW_RELAY_POLARITY", "")
+    assert load_config().relay_polarity is None
