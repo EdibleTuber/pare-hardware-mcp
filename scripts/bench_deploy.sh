@@ -34,6 +34,7 @@ FILES=(
   "src/pare_hardware_mcp/contract.py:$DEST/src/pare_hardware_mcp/contract.py"
   "src/pare_hardware_mcp/devices.py:$DEST/src/pare_hardware_mcp/devices.py"
   "src/pare_hardware_mcp/ringbuffer.py:$DEST/src/pare_hardware_mcp/ringbuffer.py"
+  "src/pare_hardware_mcp/relay.py:$DEST/src/pare_hardware_mcp/relay.py"
   "src/pare_hardware_mcp/server.py:$DEST/src/pare_hardware_mcp/server.py"
   "src/pare_hardware_mcp/session.py:$DEST/src/pare_hardware_mcp/session.py"
   "src/pare_hardware_mcp/tools.py:$DEST/src/pare_hardware_mcp/tools.py"
