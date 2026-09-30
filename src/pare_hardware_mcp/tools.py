@@ -724,7 +724,8 @@ def _artifact_root_status(root: str | None) -> dict[str, Any]:
 
 
 async def bench_status() -> str:
-    """Bench health with no session required: adapters, artifact root, drive id.
+    """Bench health with no session required: adapters, relay config,
+    artifact root, drive id.
 
     §8.4 (see pare/commands/health.py) puts the live artifact-root answer
     behind this low-tier tool because the daemon resolving the path itself
@@ -758,8 +759,23 @@ async def bench_status() -> str:
         asyncio.to_thread(_artifact_root_status, cfg.artifact_root),
         asyncio.to_thread(MANAGER.status),
     )
+    # Spec §5: the relay must be visible here when configured. It is a
+    # by-path CP2102 with a generic serial, so it does not self-label among
+    # the by-id devices above -- this is the operator's way to see which
+    # adapter is the relay and on which channel/polarity. "Configured" means
+    # all three fields, matching RelayNotConfigured's semantics: a partial
+    # declaration is a misconfiguration the power tools name explicitly, and
+    # bench_status must not present it as a working relay.
+    relay = (
+        {"device": cfg.relay_device, "channel": cfg.relay_channel,
+         "polarity": cfg.relay_polarity}
+        if cfg.relay_device and cfg.relay_channel is not None
+        and cfg.relay_polarity
+        else None
+    )
     return _ok(
         devices=[_device_summary(d) for d in devices],
+        relay=relay,
         artifact_root=artifact_root,
         session={
             "open": session_status["open"],
