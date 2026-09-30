@@ -2489,3 +2489,212 @@ def test_the_first_sweep_completes_even_when_the_budget_is_already_spent(manager
         f"{set(rates) - set(result['samples'])}")
     for rate in rates:
         assert result["listen_seconds"][rate] > 0.0, rate
+
+
+# --------------------------------------------------------------------------
+# scan_baud_cycling -- Task 3. The ACTIVE variant. A pty has no real UART
+# framing, so (like the scan_baud tests) these prove the COORDINATION, not
+# that a candidate rate is physically wrong: on_rate fires once per candidate
+# before that candidate's window, the reader is parked so a candidate's boot
+# bytes never reach the byte-exact capture, the port is reconfigured rather
+# than reopened, one gap spans the whole scan, and the port is left at a
+# known rate.
+# --------------------------------------------------------------------------
+
+def test_scan_baud_cycling_fires_on_rate_once_per_candidate_in_order(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    fired = []
+
+    def on_rate(rate):
+        fired.append(rate)
+
+    result = session.scan_baud_cycling(
+        (9600, 115200, 230400), 0.05, on_rate, no_op_decide)
+
+    assert fired == [9600, 115200, 230400], "one cycle per candidate, in order"
+    assert result["cycles"] == 3
+    assert set(result["samples"]) == {9600, 115200, 230400}
+
+
+def test_scan_baud_cycling_rejects_bad_rates_before_any_cycle(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    fired = []
+    for bad in ((9600, 0), (9600, -1), (9600, True), (9600, 3.5),
+                (9600, MAX_BAUD_RATE + 1), ()):
+        with pytest.raises(SessionError):
+            session.scan_baud_cycling(bad, 0.05, lambda r: fired.append(r),
+                                      no_op_decide)
+    assert fired == [], "a refused rate list must not cycle the target"
+    assert session.baud == 9600 and session._serial.baudrate == 9600
+
+
+def test_scan_baud_cycling_refuses_on_a_dead_session(manager, pty):
+    session = open_ok(manager, pty)
+    pty.unplug_far_end()
+    until(lambda: not session.alive, what="death")
+    fired = []
+    with pytest.raises(SessionError):
+        session.scan_baud_cycling((9600, 115200), 0.05,
+                                  lambda r: fired.append(r), no_op_decide)
+    assert fired == [], "a dead session must not cycle the target"
+
+
+def test_scan_baud_cycling_never_writes_to_the_target(manager, pty):
+    """The relay does the cycling; the console must not transmit on the line."""
+    session = open_ok(manager, pty)
+    real_write = session._serial.write
+    calls = []
+    session._serial.write = lambda data: (calls.append(bytes(data)),
+                                          real_write(data))[1]
+    session.scan_baud_cycling((9600, 115200, 230400), 0.05,
+                              lambda r: None, no_op_decide)
+    assert calls == [], f"cycling scan transmitted: {calls!r}"
+
+
+def test_scan_baud_cycling_never_reopens_the_port(manager, pty):
+    """The rate is changed via termios on the held fd, never by reopening --
+    a reopen re-asserts DTR and reboots a DTR-wired board, which the relay is
+    already deliberately doing under the caller's control."""
+    session = open_ok(manager, pty)
+    serial_obj = session._serial
+    open_calls, close_calls = [], []
+    real_open, real_close = serial_obj.open, serial_obj.close
+    serial_obj.open = lambda *a, **k: (open_calls.append(1), real_open(*a, **k))[1]
+    serial_obj.close = lambda *a, **k: (close_calls.append(1), real_close(*a, **k))[1]
+
+    session.scan_baud_cycling((9600, 115200, 230400), 0.05,
+                              lambda r: None, lambda s: 115200)
+
+    assert open_calls == [], f"reopened the port {len(open_calls)} time(s)"
+    assert close_calls == [], f"closed the port {len(close_calls)} time(s)"
+    assert session._serial is serial_obj and session._serial.is_open
+
+
+def test_scan_baud_cycling_leaves_the_port_at_the_winner(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud_cycling((9600, 115200, 230400), 0.05,
+                                       lambda r: None, lambda s: 115200)
+    assert result["winner"] == 115200
+    assert result["final_baud"] == 115200
+    assert result["restored"] is False
+    assert session.baud == 115200
+    assert session._serial.baudrate == 115200
+
+
+def test_scan_baud_cycling_restores_the_original_rate_when_no_winner(manager, pty):
+    session = open_ok(manager, pty, baud=9600)
+    result = session.scan_baud_cycling((9600, 115200), 0.05,
+                                       lambda r: None, no_op_decide)
+    assert result["winner"] is None
+    assert result["restored"] is True
+    assert session.baud == 9600
+    assert session._serial.baudrate == 9600
+
+
+def test_scan_baud_cycling_records_one_gap_spanning_the_whole_scan(manager, pty):
+    session = open_ok(manager, pty)
+    pty.send(b"before the cycling scan\r\n")
+    until(lambda: session.buffer.head > 0, what="pre-scan capture")
+    cursor_before = session.buffer.head
+
+    result = session.scan_baud_cycling((9600, 115200), 0.15,
+                                       lambda r: None, no_op_decide)
+
+    gap = result["gap"]
+    assert gap is not None
+    assert gap["at_cursor"] == cursor_before, \
+        "the gap must start where capture actually stopped"
+    assert gap["reason"] == "baud scan (cycling)"
+    assert gap["duration_s"] >= 0.15, \
+        "two 0.15s windows must show up as at least that much suspended time"
+    # ONE entry for the whole scan, not one per candidate.
+    assert manager.status()["capture_gap_count"] == 1
+    assert manager.status()["capture_suspended"] is False
+
+
+def test_scan_baud_cycling_samples_never_reach_the_capture_buffer(manager, pty):
+    """The invariant the whole coordination exists for, proven the same
+    continuous-send way as `test_scan_baud_samples_never_reach_the_capture_
+    buffer`: a mutant reader that keeps appending while the scan believes it
+    is alone has the whole scan to be caught growing `head`, and the property
+    (head never exceeds its value at the moment the reader parked) does not
+    depend on who wins any single read. Here the boot bytes are injected from
+    inside `on_rate`, exactly where a real cycled target would emit them."""
+    session = open_ok(manager, pty, baud=9600)
+
+    stop_sender = threading.Event()
+
+    def sender():
+        while not stop_sender.is_set():
+            try:
+                pty.send(b"boot" * 32)
+            except OSError:
+                return
+            time.sleep(0.005)
+
+    sender_thread = threading.Thread(target=sender, daemon=True)
+    sender_thread.start()
+
+    scan_result: dict = {}
+    scan_done = threading.Event()
+
+    def on_rate(rate):
+        # A cycled target's boot burst lands during the capture window.
+        try:
+            pty.send(b"U-Boot fresh boot\r\n")
+        except OSError:
+            pass
+
+    def run_scan():
+        scan_result["value"] = session.scan_baud_cycling(
+            (9600, 115200, 230400), 0.2, on_rate, no_op_decide)
+        scan_done.set()
+
+    scanner_thread = threading.Thread(target=run_scan, daemon=True)
+    scanner_thread.start()
+    until(lambda: session._scan_parked.is_set(), what="the reader to park")
+    head_at_park = session.buffer.head
+
+    observed_heads = []
+    while not scan_done.is_set():
+        observed_heads.append(session.buffer.head)
+        time.sleep(0.01)
+
+    stop_sender.set()
+    sender_thread.join(DEADLINE)
+    scanner_thread.join(DEADLINE)
+
+    assert observed_heads, "the poll loop never ran; this test proves nothing"
+    assert max(observed_heads) == head_at_park, (
+        f"buffer.head grew from {head_at_park} to {max(observed_heads)} while "
+        "the cycling scan believed it was the only thing reading the port")
+    total_sampled = sum(len(v) for v in scan_result["value"]["samples"].values())
+    assert total_sampled > 0, (
+        "no bytes reached the scan's own samples -- this test proves nothing")
+
+
+def test_scan_baud_cycling_propagates_an_on_rate_exception_after_cleanup(manager, pty):
+    """A relay that will not answer raises out of on_rate. The exception must
+    propagate (tools.py catches RelayError to render safe_message) AFTER the
+    port is restored to a known rate, the reader is unparked, and the lock is
+    released -- not be swallowed, and not leave the session wedged."""
+    session = open_ok(manager, pty, baud=9600)
+
+    class RelayBoom(RuntimeError):
+        pass
+
+    def on_rate(rate):
+        raise RelayBoom("relay did not answer")
+
+    with pytest.raises(RelayBoom):
+        session.scan_baud_cycling((9600, 115200), 0.05, on_rate, no_op_decide)
+
+    # Restored and usable: reader unparked, port at the original rate.
+    assert session.baud == 9600
+    assert session._serial.baudrate == 9600
+    assert not session._scan_pause.is_set()
+    pty.send(b"still capturing\r\n")
+    until(lambda: b"still capturing" in session.buffer.read(0)[0],
+          what="capture resumed after the on_rate failure")
+    # The write lock was released -- a subsequent scan can acquire it.
+    session.scan_baud_cycling((9600,), 0.05, lambda r: None, no_op_decide)

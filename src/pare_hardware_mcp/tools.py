@@ -44,13 +44,16 @@ import os
 import re
 from typing import Any
 
-from pare_hardware_mcp.baud import (BaudScanError, DEFAULT_DWELL_SECONDS,
+from pare_hardware_mcp.baud import (BaudScanError, CYCLE_MARGIN_S,
+                                    DEFAULT_CYCLE_CAPTURE_MS,
+                                    DEFAULT_DWELL_SECONDS,
                                     looks_like_console_bytes,
                                     GROUND_CROSSOVER_HINT, all_scored_poorly,
                                     all_silent, check_budget, pick_winner,
                                     rank_candidates, sanitize_rates)
 from pare_hardware_mcp.config import load_config
 from pare_hardware_mcp.devices import list_serial_devices
+from pare_hardware_mcp.relay import RelayController, RelayError, RelayNotConfigured
 from pare_hardware_mcp.ringbuffer import (CursorError, DEFAULT_READ_LIMIT,
                                           MAX_READ_LIMIT)
 from pare_hardware_mcp.session import SessionError, SessionManager
@@ -535,6 +538,142 @@ async def console_detect_baud(device: str | None = None,
     return _ok(**response)
 
 
+async def console_detect_baud_cycling(session: str,
+                                      rates: list[int] | None = None,
+                                      off_ms: int = 3000,
+                                      capture_ms: int | None = None) -> str:
+    """ACTIVE baud detection: power-cycle the target at each candidate rate.
+
+    The counterpart to `console_detect_baud`. That tool is PASSIVE -- it
+    listens to a line that is already chattering and never transmits or cycles
+    power. This one is for the case that defeats it: a target whose only output
+    is a boot burst of a few milliseconds, which a passive sweep is almost
+    never listening for when it lands. For each candidate rate it sets the open
+    session's line speed, fires `RelayController.power_cycle` to force a fresh
+    boot, captures a window of that boot, and scores it -- so the burst is
+    caught on a boot the agent CHOSE the moment of, not by luck.
+
+    TIER HIGH (see contract.py): it cycles power to a live bench target, the
+    same reason the bare relay tools are pinned high.
+
+    Preconditions, both refused BEFORE anything is cycled: a relay must be
+    configured, and there must be an open, ALIVE session (this tool scans that
+    session's held descriptor and, like `console_detect_baud`, never opens or
+    closes a port of its own -- a reopen would re-assert DTR and reboot a
+    DTR-wired board between candidates).
+
+    BUDGET REFUSAL BEFORE THE FIRST CYCLE. The worst-case wall time is
+    `len(rates) * (off_ms + capture_ms + margin)`; if that exceeds
+    `min(scan_budget_s, request_deadline_s)` the scan is refused and NOTHING is
+    cycled. Cycling the target N times and then timing out is strictly worse
+    than not starting -- it strands the target through repeated reboots for a
+    scan that was never going to finish.
+
+    Returns ranked per-rate evidence, never a bare verdict: every candidate
+    appears in `candidates` with its scores and its `sample_b64`, even when
+    nothing clears the winner bar (`best` is then null), so the operator can
+    eyeball the boots during enumeration.
+    """
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
+
+    try:
+        sess = await asyncio.to_thread(MANAGER.get, session)
+    except KeyError:
+        return _err(f"no such session {session!r}; call console_open first. "
+                    "console_detect_baud_cycling scans an already-open "
+                    "session's held descriptor and never opens a port of its "
+                    "own")
+    if not sess.alive:
+        return _err(
+            f"session {session!r} is not alive, refusing to cycle-scan: "
+            f"{getattr(sess, 'death_reason', 'unknown')}")
+
+    try:
+        candidate_rates = sanitize_rates(rates)
+    except BaudScanError as exc:
+        return _err(str(exc))
+
+    capture_ms_effective = (DEFAULT_CYCLE_CAPTURE_MS if capture_ms is None
+                            else capture_ms)
+    capture_seconds = capture_ms_effective / 1000.0
+
+    # The tighter of the two limits: a generous scan budget must not let the
+    # sweep run past a short request deadline, and vice versa. Read once here
+    # so the refusal and the (implicit) work below cannot disagree.
+    budget = min(CONFIG.scan_budget_s, CONFIG.request_deadline_s)
+    # `max(0, ...)` on each term so a negative off_ms/capture_ms cannot SHRINK
+    # the worst-case estimate and slip a scan past the budget it exists to
+    # enforce -- the refusal must never under-count. (The relay clamps the
+    # actual off-time to a floor of its own, so a small positive off_ms only
+    # under-counts by well under CYCLE_MARGIN_S.)
+    per_candidate_s = (max(0.0, off_ms / 1000.0)
+                       + max(0.0, capture_seconds) + CYCLE_MARGIN_S)
+    worst_case_s = len(candidate_rates) * per_candidate_s
+    if worst_case_s > budget:
+        return _err(
+            f"a cycle-assisted scan of {len(candidate_rates)} rate(s) at "
+            f"off_ms={off_ms} and capture_ms={capture_ms_effective} would take "
+            f"up to {worst_case_s:.1f}s, over this worker's {budget:.1f}s "
+            "budget -- refusing before cycling the target rather than cycling "
+            "it repeatedly and then timing out. Pass fewer rates, a shorter "
+            "off_ms, or a shorter capture_ms; an operator can raise "
+            "PARE_HW_SCAN_BUDGET_S or PARE_HW_REQUEST_DEADLINE_S."
+        )
+
+    def on_rate(rate: int) -> None:
+        # Fired by scan_baud_cycling once per candidate, while the reader is
+        # parked and it holds the port. The relay is a separate device, so
+        # this never contends with the session's descriptor. A RelayError
+        # here propagates out of scan_baud_cycling (after it restores the port
+        # and unparks the reader) and is caught below.
+        relay.power_cycle(off_ms)
+
+    try:
+        # The longest call in the worker by far -- N power cycles plus N
+        # capture windows -- so it runs off the event loop like the passive
+        # scan, and for the same reason: a concurrent low-tier call (status, a
+        # read) must not be starved for the whole scan.
+        result = await asyncio.to_thread(
+            sess.scan_baud_cycling, candidate_rates, capture_seconds,
+            on_rate, pick_winner)
+    except SessionError as exc:
+        return _err(str(exc))
+    except RelayError as exc:
+        # The relay would not answer partway through. Never the raw AT command
+        # -- see _resolve_relay / RelayError.safe_message.
+        return _err(exc.safe_message)
+
+    samples = result["samples"]
+    candidates = rank_candidates(samples, result["listen_seconds"])
+    for candidate in candidates:
+        candidate["sample_b64"] = base64.b64encode(
+            candidate.pop("sample")).decode("ascii")
+
+    winner = result["winner"]
+    return _ok(
+        session=sess.id,
+        candidates=candidates,
+        best={"rate": winner} if winner is not None else None,
+        original_baud=result["original_baud"],
+        final_baud=result["final_baud"],
+        restored=result["restored"],
+        cycles=result["cycles"],
+        # A candidate rate the hardware itself refused at apply time, named
+        # per rate alongside the ones that WERE cycled -- never thrown away
+        # wholesale. Same {rate, reason} shape as `candidates` (session.py's
+        # {rate: reason} would coerce its int keys to strings over JSON).
+        rejected=[{"rate": rate, "reason": reason}
+                  for rate, reason in result["rejected"].items()],
+        alive=result["alive"],
+        death_reason=result["death_reason"],
+        # The whole sweep suspended the reader -- a real hole in the boot log,
+        # also visible via console_status/console_read.
+        capture_gap=result["gap"],
+    )
+
+
 def _device_summary(device) -> dict[str, Any]:
     # by_id/tty/serial/interface only -- NEVER voltage. The Tigard's level
     # selector is a physical slide switch with no software read-back,
@@ -585,7 +724,8 @@ def _artifact_root_status(root: str | None) -> dict[str, Any]:
 
 
 async def bench_status() -> str:
-    """Bench health with no session required: adapters, artifact root, drive id.
+    """Bench health with no session required: adapters, relay config,
+    artifact root, drive id.
 
     §8.4 (see pare/commands/health.py) puts the live artifact-root answer
     behind this low-tier tool because the daemon resolving the path itself
@@ -619,8 +759,23 @@ async def bench_status() -> str:
         asyncio.to_thread(_artifact_root_status, cfg.artifact_root),
         asyncio.to_thread(MANAGER.status),
     )
+    # Spec §5: the relay must be visible here when configured. It is a
+    # by-path CP2102 with a generic serial, so it does not self-label among
+    # the by-id devices above -- this is the operator's way to see which
+    # adapter is the relay and on which channel/polarity. "Configured" means
+    # all three fields, matching RelayNotConfigured's semantics: a partial
+    # declaration is a misconfiguration the power tools name explicitly, and
+    # bench_status must not present it as a working relay.
+    relay = (
+        {"device": cfg.relay_device, "channel": cfg.relay_channel,
+         "polarity": cfg.relay_polarity}
+        if cfg.relay_device and cfg.relay_channel is not None
+        and cfg.relay_polarity
+        else None
+    )
     return _ok(
         devices=[_device_summary(d) for d in devices],
+        relay=relay,
         artifact_root=artifact_root,
         session={
             "open": session_status["open"],
@@ -628,3 +783,96 @@ async def bench_status() -> str:
             "alive": session_status["alive"],
         },
     )
+
+
+_NO_RELAY_MSG = (
+    "no relay is configured for this bench: set PARE_HW_RELAY_DEVICE, "
+    "PARE_HW_RELAY_CHANNEL and PARE_HW_RELAY_POLARITY"
+)
+
+
+def _resolve_relay() -> tuple[RelayController | None, str | None]:
+    """`RelayController.from_config(CONFIG)`, or a ready-to-return `_err`.
+
+    `RelayController` and `CONFIG` are looked up at call time (not captured
+    into a local at import time), which is what lets tests replace either
+    one with `monkeypatch.setattr(tools, ...)` -- the same seam
+    `bench_status`'s `MANAGER`/`list_serial_devices` and
+    `console_detect_baud`'s `_manager_current` already rely on.
+
+    `RelayNotConfigured` (no relay declared for this bench) is caught
+    BEFORE the plain `RelayError` it subclasses, so this is not the usual
+    "subclass shadows base" bug -- it is the reverse: `from_config` only
+    validates presence, and a PRESENT but invalid `relay_polarity` reaches
+    `RelayController.__init__` (relay.py) and raises a bare `RelayError`
+    there. Production `load_config` validates polarity before it ever
+    reaches here, but "never raises out of the handler" is a guarantee
+    about this function, not about what callers happen to pass -- and the
+    tests construct `Config(...)` directly, bypassing that validation. Both
+    branches return `exc.safe_message`/the fixed message rather than
+    `str(exc)`: neither may ever contain a raw `AT+CHn=` string (spec
+    design line 67).
+    """
+    try:
+        return RelayController.from_config(CONFIG), None
+    except RelayNotConfigured:
+        return None, _err(_NO_RELAY_MSG)
+    except RelayError as exc:
+        return None, _err(exc.safe_message)
+
+
+async def power_status() -> str:
+    """Current target power state, read from the relay.
+
+    Tier high (see contract.py): grouped with the other relay tools rather
+    than split by read/write, since a status query still requires opening
+    the relay's serial port and any relay tool touching a live bench target
+    warrants the same operator gate. Never raises out of the handler --
+    `RelayNotConfigured` and `RelayError` both become an `_err`, and neither
+    ever carries the raw AT command (`exc.safe_message`, not `str(exc)`).
+    """
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
+    try:
+        status = await asyncio.to_thread(relay.status)
+    except RelayError as exc:
+        return _err(exc.safe_message)
+    return _ok(**status)
+
+
+async def power_set(state: str) -> str:
+    """Set the target's power to `state` (`"on"` or `"off"`) via the relay.
+
+    Off the event loop: `RelayController.set_power` opens a serial port,
+    round-trips an AT command and closes it again -- the same blocking-I/O
+    rule as every other handler in this module. Never raises out of the
+    handler, and never returns the raw AT command -- see `_resolve_relay`.
+    """
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
+    try:
+        status = await asyncio.to_thread(relay.set_power, state)
+    except RelayError as exc:
+        return _err(exc.safe_message)
+    return _ok(**status)
+
+
+async def power_cycle(off_ms: int = 3000) -> str:
+    """Off, wait `off_ms` (clamped by the driver), on -- restoring on always.
+
+    `RelayController.power_cycle` restores power in a `finally`, so even a
+    failure mid-cycle leaves the target on rather than stranded off (D7);
+    this handler just surfaces whatever that call returns or raises. Off the
+    event loop like every other relay call, and never raises out of the
+    handler, and never returns the raw AT command -- see `_resolve_relay`.
+    """
+    relay, err = _resolve_relay()
+    if err is not None:
+        return err
+    try:
+        result = await asyncio.to_thread(relay.power_cycle, off_ms)
+    except RelayError as exc:
+        return _err(exc.safe_message)
+    return _ok(**result["status"], off_ms_actual=result["off_ms_actual"])

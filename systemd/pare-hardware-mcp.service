@@ -7,9 +7,12 @@
 #           sudo systemctl daemon-reload
 #           sudo systemctl enable --now pare-hardware-mcp
 #
-# Depends on hardware: /dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if01-port0
+# Depends on hardware: /dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if00-port0
 # must be present for the worker's console tools to open a session -- but the
 # worker itself starts regardless and reports the honest error at tool time.
+# The power tools additionally need the relay adapter (PARE_HW_RELAY_* below);
+# the worker also starts without it, and the tools report a clean error at
+# call time instead.
 
 [Unit]
 Description=PARE hardware MCP worker (Tigard UART / JTAG / glitch)
@@ -36,8 +39,16 @@ ExecStart=/opt/pare/hardware-mcp/.venv/bin/pare-hardware-mcp
 Environment=AGENT_WORKER_TRANSPORT=http
 Environment=AGENT_WORKER_HOST=tailscale0
 Environment=AGENT_WORKER_PORT=9102
-Environment=PARE_HW_DEVICE=/dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if01-port0
+Environment=PARE_HW_DEVICE=/dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if00-port0
 Environment=PARE_HW_EXPECT_SERIAL=TG1119e7
+# Bench relay (DSD TECH SH-UR04A, CP2102): by-path, because its serial is a
+# generic 0001 and by-id would be ambiguous. Target power is on channel 1,
+# normally-closed -- energising the channel CUTS the target's power.
+# SupplementaryGroups=dialout and DeviceAllow=char-ttyUSB rw above already
+# cover the relay's /dev/ttyUSB* node (both are group/class-wide).
+Environment=PARE_HW_RELAY_DEVICE=/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0
+Environment=PARE_HW_RELAY_CHANNEL=1
+Environment=PARE_HW_RELAY_POLARITY=nc
 Environment=PYTHONUNBUFFERED=1
 # pare-worker-kit's HTTP request-audit log defaults to
 # $HOME/.local/state/pare-worker/requests.log, which ProtectHome=true below

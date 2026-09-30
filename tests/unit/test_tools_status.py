@@ -38,3 +38,46 @@ async def test_bench_status_reads_the_drive_id_when_present(monkeypatch, tmp_pat
 async def test_bench_status_works_with_no_session_open(monkeypatch):
     out = json.loads(await tools.bench_status())
     assert "session" in out
+
+
+async def test_bench_status_reports_the_configured_relay(monkeypatch):
+    # Spec §5: when the relay is configured, the operator must be able to see
+    # the relay adapter the same way they see the Tigard. The relay is
+    # by-path (a generic CP2102 serial), so it does not self-label in
+    # list_devices' by-id entries -- this field is what tells the operator
+    # which enumerated adapter is the relay, plus its channel and polarity.
+    monkeypatch.setenv(
+        "PARE_HW_RELAY_DEVICE",
+        "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0",
+    )
+    monkeypatch.setenv("PARE_HW_RELAY_CHANNEL", "1")
+    monkeypatch.setenv("PARE_HW_RELAY_POLARITY", "nc")
+    out = json.loads(await tools.bench_status())
+    assert out["relay"] == {
+        "device": "/dev/serial/by-path/platform-xhci-hcd.0-usb-0:2:1.0-port0",
+        "channel": 1,
+        "polarity": "nc",
+    }
+
+
+@pytest.mark.parametrize(
+    "env",
+    [
+        {},  # nothing set
+        {"PARE_HW_RELAY_DEVICE": "/dev/serial/by-path/x-port0"},  # partial
+        {"PARE_HW_RELAY_DEVICE": "/dev/serial/by-path/x-port0",
+         "PARE_HW_RELAY_CHANNEL": "1"},  # partial
+    ],
+)
+async def test_bench_status_relay_is_null_when_not_fully_configured(monkeypatch, env):
+    # "Configured" means the power tools can actually use it -- all three
+    # fields, matching RelayNotConfigured's semantics. A partial declaration
+    # is a misconfiguration the power tools already name explicitly;
+    # bench_status must not present a half-set relay as a working one.
+    for var in ("PARE_HW_RELAY_DEVICE", "PARE_HW_RELAY_CHANNEL",
+                "PARE_HW_RELAY_POLARITY"):
+        monkeypatch.delenv(var, raising=False)
+    for var, value in env.items():
+        monkeypatch.setenv(var, value)
+    out = json.loads(await tools.bench_status())
+    assert out["relay"] is None
