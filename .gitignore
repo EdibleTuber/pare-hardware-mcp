@@ -131,3 +131,6 @@ dmypy.json
 
 # SDD scratch (controller artifacts, not part of the package)
 .superpowers/
+
+# Serena (per-project LSP config, memories, cache)
+.serena/
