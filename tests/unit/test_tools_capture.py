@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 
 import pytest
 
@@ -17,7 +18,9 @@ from pare_hardware_mcp import tools
 from pare_hardware_mcp.config import Config
 from pare_hardware_mcp.ringbuffer import CaptureBuffer
 
-from pare_worker_kit import PRODUCES_ARTIFACT, RESERVED_SLUG_ARG, RESERVED_DRIVE_ID_ARG
+from pare_worker_kit import (PRODUCES_ARTIFACT, RESERVED_SLUG_ARG,
+                              RESERVED_DRIVE_ID_ARG, ArtifactWriteError,
+                              DriveReadOnlyError)
 
 SENTINEL = "b2657680-9f16-4918-9195-ef3ba17da924"
 SLUG = "wbench-test"  # must satisfy the kit's SLUG_RE -- check at run time
@@ -233,3 +236,93 @@ async def test_a_wrap_landing_between_precheck_and_read_is_refused(tmp_path, mon
     out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
     assert "oldest retained" in out["error"]        # the eviction refusal, again
     assert not (root / SLUG).exists()
+
+
+async def test_absent_sentinel_is_named(rig):
+    mgr, root = rig
+    (root / ".bench-store-id").unlink()
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert ".bench-store-id" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_mismatched_sentinel_names_both_uuids(rig):
+    mgr, root = rig
+    (root / ".bench-store-id").write_text("0361c41f-e680-4d4e-b9c3-39af8a33d067\n")
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert SENTINEL in out["error"]
+    assert "0361c41f" in out["error"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root bypasses mode bits; EROFS is untestable")
+async def test_eacces_root_yields_a_named_error_not_a_crash(rig):
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    os.chmod(root, 0o555)
+    try:
+        out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    finally:
+        os.chmod(root, 0o755)          # a 555 dir is not unlinkable by its owner
+    # chmod 555 yields EACCES, not EROFS (a real EROFS needs a read-only mount,
+    # which is sudo-only); this pins the kit's base-class NAMED message for
+    # non-special errnos — the guarantee that no bare OSError ever reaches the
+    # model (the write-probe case the plan intended is covered by
+    # test_readonly_root_reaches_the_model_verbatim).
+    assert "Permission denied" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_readonly_root_reaches_the_model_verbatim(rig, monkeypatch):
+    # A real EROFS needs a read-only mount (sudo-only); inject the kit's
+    # own exception at the seam — same pattern as the ENOSPC test.
+    mgr, root = rig
+    temp = str(root / SLUG / "a+partial")
+    msg = (f"the artifact root is read-only: creating {temp!r} failed (EROFS); "
+           f"ext4 remounts read-only when it detects an error, so check the drive")
+    def _full(*args, **kwargs):
+        raise DriveReadOnlyError(msg)
+    monkeypatch.setattr(tools, "open_artifact", _full)
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert out["error"] == msg   # verbatim, byte for byte
+
+
+async def test_name_collision_is_refused_and_the_file_untouched(rig):
+    mgr, root = rig
+    dest = root / SLUG / "a"
+    dest.parent.mkdir()
+    dest.write_bytes(b"someone else's artifact")
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert "a" in out["error"]          # the collision names the artifact
+    assert dest.read_bytes() == b"someone else's artifact"   # RENAME_NOREPLACE: no overwrite
+
+
+async def test_a_stale_partial_is_named_and_left_in_place(rig):
+    mgr, root = rig
+    partial = root / SLUG / "a+partial"
+    partial.parent.mkdir()
+    partial.write_bytes(b"orphan")
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert "a+partial" in out["error"]  # named, not assumed abandoned
+    assert partial.read_bytes() == b"orphan"
+
+
+async def test_enospc_reaches_the_model_verbatim(rig, monkeypatch):
+    # ENOSPC is the kit-owned case (loopback, parent P2); the unit environment
+    # cannot fill a filesystem, so the seam is injected with the kit's OWN
+    # exception carrying its OWN message (⟨ENOSPC_MSG⟩ from the ledger). The
+    # handler's job is to surface it verbatim (spec §5.7), not to translate
+    # or wrap it.
+    def _full(*args, **kwargs):
+        raise ArtifactWriteError(
+            "the drive filled up mid-write: 2048 of 4096 bytes of this write landed before ENOSPC; make room and retry")
+    monkeypatch.setattr(tools, "open_artifact", _full)
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert out["error"] == "the drive filled up mid-write: 2048 of 4096 bytes of this write landed before ENOSPC; make room and retry"   # verbatim, byte for byte

@@ -56,7 +56,7 @@ from pare_hardware_mcp.devices import list_serial_devices
 from pare_hardware_mcp.relay import RelayController, RelayError, RelayNotConfigured
 from pare_hardware_mcp.ringbuffer import (CursorError, DEFAULT_READ_LIMIT,
                                           MAX_READ_LIMIT)
-from pare_worker_kit import open_artifact
+from pare_worker_kit import ArtifactPathError, ArtifactWriteError, open_artifact
 from pare_hardware_mcp.session import SessionError, SessionManager
 
 CONFIG = load_config()
@@ -272,7 +272,12 @@ async def console_capture(session: str, name: str, from_cursor: int = 0,
             art.write(data)
         return art.descriptor
 
-    return _ok(**await asyncio.to_thread(_write))
+    try:
+        return _ok(**await asyncio.to_thread(_write))
+    except (ArtifactWriteError, ArtifactPathError) as exc:
+        # The kit's named messages ARE the diagnostics (spec §5.7): surface
+        # verbatim. No wrapping, no rewording, no second validation layer.
+        return _err(str(exc))
 
 
 async def console_status() -> str:
