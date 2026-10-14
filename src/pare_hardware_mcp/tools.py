@@ -56,6 +56,7 @@ from pare_hardware_mcp.devices import list_serial_devices
 from pare_hardware_mcp.relay import RelayController, RelayError, RelayNotConfigured
 from pare_hardware_mcp.ringbuffer import (CursorError, DEFAULT_READ_LIMIT,
                                           MAX_READ_LIMIT)
+from pare_worker_kit import open_artifact
 from pare_hardware_mcp.session import SessionError, SessionManager
 
 CONFIG = load_config()
@@ -199,6 +200,43 @@ async def console_read(session: str, cursor: int = 0,
                next_cursor=next_cursor, dropped=dropped, remaining=remaining,
                limit_applied=capped,
                alive=sess.alive, capture_gaps=capture_gaps)
+
+
+async def console_capture(session: str, name: str, from_cursor: int = 0,
+                          to_cursor: int | None = None,
+                          project_slug: str | None = None,
+                          expected_drive_id: str | None = None) -> str:
+    """Snapshot a cursor window of the session's capture buffer to the
+    artifact drive. The result is the descriptor, not the bytes. See the
+    contract entry for the wire description."""
+    try:
+        sess = await asyncio.to_thread(MANAGER.get, session)
+    except KeyError:
+        return _err(f"no such session {session!r}")
+    try:
+        head = sess.buffer.head
+        to = head if to_cursor is None else to_cursor
+        # One read of [from_cursor, to): snapshot, not drain. Inline, like
+        # console_read's -- the buffer lock is a leaf held for a memory copy.
+        data, _next, _dropped, _remaining = sess.buffer.read(
+            from_cursor, to - from_cursor)
+    except SessionError as exc:
+        # A close landed between MANAGER.get returning and the buffer being
+        # read (spec §5.6) -- the same catch console_read carries.
+        return _err(str(exc))
+
+    def _write():
+        # The write is owned by the artifact mechanism: sentinel check,
+        # O_CREAT|O_EXCL temp, inline hash, expected_size short-write check,
+        # RENAME_NOREPLACE. Off the loop: it is real disk I/O.
+        with open_artifact(CONFIG.artifact_root, project_slug, name,
+                           media_type="application/octet-stream",
+                           expect_drive_id=expected_drive_id,
+                           expected_size=len(data)) as art:
+            art.write(data)
+        return art.descriptor
+
+    return _ok(**await asyncio.to_thread(_write))
 
 
 async def console_status() -> str:

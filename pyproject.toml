@@ -15,7 +15,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest", "pytest-asyncio"]
+dev = ["pytest", "pytest-asyncio", "agent_core @ git+https://github.com/EdibleTuber/agent_core.git@v1.12.0"]
 
 [project.scripts]
 pare-hardware-mcp = "pare_hardware_mcp.server:main"
