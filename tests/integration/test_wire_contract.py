@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import pytest
-from pare_worker_kit import (PRODUCES_META_KEY, PRODUCES_RESULT,
-                             RISK_TIER_META_KEY, VALID_RISK_TIERS)
+from pare_worker_kit import (PRODUCES_ARTIFACT, PRODUCES_META_KEY,
+                              PRODUCES_RESULT, VALID_PRODUCES,
+                              RISK_TIER_META_KEY, VALID_RISK_TIERS)
 
 from pare_hardware_mcp.contract import TOOL_SPECS
 from pare_hardware_mcp.server import build_server
@@ -16,7 +17,7 @@ async def test_every_contract_tool_is_registered_with_both_meta_keys():
     for spec in TOOL_SPECS:
         meta = tools[spec.name].meta
         assert meta[RISK_TIER_META_KEY] == spec.risk_tier
-        assert meta[PRODUCES_META_KEY] == PRODUCES_RESULT
+        assert meta[PRODUCES_META_KEY] == spec.produces
         assert meta[RISK_TIER_META_KEY] in VALID_RISK_TIERS
 
 
@@ -34,3 +35,14 @@ def test_the_server_is_named_for_its_distribution():
     # networked worker's only provenance. A mismatched name silently reports
     # no version at all.
     assert build_server().name == "pare-hardware-mcp"
+
+
+async def test_console_capture_advertises_the_reserved_artifact_args():
+    # FastMCP derives the wire inputSchema from the handler signature, so this
+    # asserts the declaration that actually ships, from list_tools output.
+    from pare_worker_kit import RESERVED_SLUG_ARG, RESERVED_DRIVE_ID_ARG
+    server = build_server()
+    tools = {t.name: t for t in await server.list_tools()}
+    props = tools["console_capture"].inputSchema["properties"]
+    assert RESERVED_SLUG_ARG in props
+    assert RESERVED_DRIVE_ID_ARG in props

@@ -5,15 +5,16 @@ from __future__ import annotations
 import subprocess
 import sys
 
-from pare_worker_kit import PRODUCES_RESULT, VALID_RISK_TIERS
+from pare_worker_kit import (PRODUCES_ARTIFACT, PRODUCES_RESULT,
+                              VALID_PRODUCES, VALID_RISK_TIERS)
 
 from pare_hardware_mcp.contract import CONTRACT_VERSION, TOOL_SPECS
 
 EXPECTED = {
     "list_devices", "bench_status", "console_detect_baud",
     "console_detect_baud_cycling", "console_open",
-    "console_read", "console_send", "console_status", "console_close",
-    "power_status", "power_set", "power_cycle",
+    "console_read", "console_capture", "console_send", "console_status",
+    "console_close", "power_status", "power_set", "power_cycle",
 }
 
 
@@ -29,10 +30,29 @@ def test_no_tool_name_carries_the_worker_prefix():
         assert not spec.name.startswith("hardware_"), spec.name
 
 
-def test_every_tool_advertises_a_valid_tier_and_produces_result():
+def test_every_tool_advertises_a_valid_tier_and_a_known_produces():
     for spec in TOOL_SPECS:
         assert spec.risk_tier in VALID_RISK_TIERS, spec.name
-        assert spec.produces == PRODUCES_RESULT, spec.name
+        assert spec.produces in VALID_PRODUCES, spec.name
+
+
+def test_console_capture_is_the_only_artifact_producer():
+    # The first produces=artifact tool in the fleet. Everything else returns
+    # model-consumed results; the artifact channel is the descriptor, nothing else.
+    for spec in TOOL_SPECS:
+        want = PRODUCES_ARTIFACT if spec.name == "console_capture" else PRODUCES_RESULT
+        assert spec.produces == want, spec.name
+
+
+def test_console_capture_declares_the_reserved_artifact_args():
+    # Parent §10 Risk-1 mitigation, pinned on the contract document: an author who
+    # does not know a name is reserved fails the build. Via the kit constants,
+    # not literals (anti-rot).
+    from pare_worker_kit import RESERVED_SLUG_ARG, RESERVED_DRIVE_ID_ARG
+    spec = next(s for s in TOOL_SPECS if s.name == "console_capture")
+    props = spec.input_schema["properties"]
+    assert RESERVED_SLUG_ARG in props
+    assert RESERVED_DRIVE_ID_ARG in props
 
 
 # console_detect_baud_cycling is pinned high because it cycles power to a live

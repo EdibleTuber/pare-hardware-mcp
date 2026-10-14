@@ -15,7 +15,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-from pare_worker_kit import PRODUCES_RESULT
+from pare_worker_kit import (PRODUCES_ARTIFACT, PRODUCES_RESULT,
+                              RESERVED_DRIVE_ID_ARG, RESERVED_SLUG_ARG)
 
 # `ringbuffer` imports nothing at all -- it does not reach pyserial and it
 # does not reach a device -- so this stays inside the no-hardware rule
@@ -103,6 +104,30 @@ TOOL_SPECS: list[ToolSpec] = [
              "is non-zero, call again with `next_cursor` to drain the rest.",
              _in(session={"type": "string"}, cursor={"type": "integer"},
                  limit={"type": "integer"})),
+    ToolSpec("console_capture", "low",
+             "Snapshot a cursor window of this session's capture buffer to a file "
+             "on the bench's artifact drive. The result is the artifact DESCRIPTOR "
+             "(path, size, sha256, ...) -- the file, not its bytes. SNAPSHOT, NOT "
+             "DRAIN: one read of [from_cursor, to_cursor); console_read's cursor is "
+             "untouched, and bytes that arrive after the snapshot are what the NEXT "
+             "read or capture sees. The window must lie entirely within the "
+             "retained buffer: a from_cursor evicted by wraparound is refused "
+             "(the file would silently omit its claimed prefix, and the "
+             "descriptor has no field to say so), a cursor ahead of the buffer "
+             "head is refused rather than clamped, and an empty window is "
+             "refused before anything is written. The write is owned by the "
+             "artifact mechanism, not this handler; its failures (drive "
+             "unmounted, read-only, full, name collision, stale +partial) come "
+             "back as named errors. The descriptor does NOT record capture "
+             "gaps: query console_read's capture_gaps or console_status for "
+             "the same window before relying on the file as unbroken.",
+             _in(session={"type": "string"},
+                 from_cursor={"type": "integer"},
+                 to_cursor={"type": "integer"},
+                 name={"type": "string"},
+                 **{RESERVED_SLUG_ARG: {"type": "string"}},
+                 **{RESERVED_DRIVE_ID_ARG: {"type": "string"}}),
+             produces=PRODUCES_ARTIFACT),
     ToolSpec("console_send", "high",
              "Send bytes to the target. PINNED high in workers.yaml: a console "
              "at a bootloader prompt can write flash.",
