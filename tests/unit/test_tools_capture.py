@@ -132,3 +132,104 @@ async def test_a_mismatched_drive_id_fails_validation(rig):
                       artifact_host="100.97.133.126")
     with pytest.raises(DescriptorError):
         validate_descriptor(out, spec=spec, tool="console_capture", slug=SLUG)
+
+
+async def test_undeclared_root_is_refused_before_anything_is_opened(tmp_path, monkeypatch):
+    monkeypatch.setattr(tools, "CONFIG", Config())   # artifact_root is None
+    monkeypatch.setattr(tools, "MANAGER", FakeManager())
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert "PARE_HW_ARTIFACT_ROOT" in out["error"]
+    assert not any(tmp_path.iterdir())              # nothing opened, nothing written
+
+
+async def test_missing_reserved_args_are_refused(rig):
+    # A declared root reached without the daemon's injection is a wiring fault:
+    # fail closed with its own named error, not a kit crash.
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(session="s-1", name="a"))
+    assert "reserved artifact arguments" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_negative_cursor_is_refused(rig):
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(
+        session="s-1", name="a", from_cursor=-1, **reserved()))
+    assert "invalid cursor" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_from_ahead_of_head_is_refused_not_clamped(rig):
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(
+        session="s-1", name="a", from_cursor=99, **reserved()))
+    assert "invalid cursor" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_to_ahead_of_head_is_refused_not_clamped(rig):
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(
+        session="s-1", name="a", to_cursor=99, **reserved()))
+    assert "invalid cursor" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_evicted_window_is_refused_with_the_oldest_retained_named(rig):
+    mgr, root = rig
+    mgr.current = FakeSession(capacity=64)
+    mgr.current.buffer.append(b"x" * 100)           # head=100, oldest=36
+    out = json.loads(await tools.console_capture(
+        session="s-1", name="a", from_cursor=0, **reserved()))
+    assert "36" in out["error"]                     # oldest retained, named
+    # and the re-request from the oldest retained cursor succeeds:
+    await tools.console_capture(session="s-1", name="a", from_cursor=36, **reserved())
+    assert (root / SLUG / "a").read_bytes() == b"x" * 64
+
+
+async def test_empty_window_is_refused_before_the_artifact_is_opened(rig):
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")
+    out = json.loads(await tools.console_capture(
+        session="s-1", name="a", from_cursor=2, to_cursor=2, **reserved()))
+    assert "empty" in out["error"]
+    assert not (root / SLUG).exists()
+
+
+async def test_window_to_the_head_is_empty_when_from_is_the_head(rig):
+    mgr, root = rig
+    mgr.current.buffer.append(b"abcd")              # head=4
+    out = json.loads(await tools.console_capture(
+        session="s-1", name="a", from_cursor=4, **reserved()))  # to defaults to 4
+    assert "empty" in out["error"]
+
+
+async def test_a_wrap_landing_between_precheck_and_read_is_refused(tmp_path, monkeypatch):
+    # Deterministic reproduction of the reader thread landing between the
+    # handler's pre-check and its read: a real CaptureBuffer whose read()
+    # first appends enough to wrap from_cursor out (real wrap, real dropped
+    # count -- the subclass only schedules the append).
+    root = tmp_path / "bench-store"
+    root.mkdir()
+    (root / ".bench-store-id").write_text(SENTINEL + "\n")
+    monkeypatch.setattr(tools, "CONFIG", Config(artifact_root=str(root)))
+
+    class _FillingBuffer(CaptureBuffer):
+        def __init__(self):
+            super().__init__(capacity=64)
+            self.append(b"x" * 60)                  # head=60: from=0 passes pre-checks
+        def read(self, cursor, limit=None):
+            self.append(b"y" * 10)                  # head=70, oldest=6: wrap lands
+            return super().read(cursor, limit)
+
+    mgr = FakeManager()
+    mgr.current = FakeSession()
+    mgr.current.buffer = _FillingBuffer()
+    monkeypatch.setattr(tools, "MANAGER", mgr)
+    out = json.loads(await tools.console_capture(session="s-1", name="a", **reserved()))
+    assert "oldest retained" in out["error"]        # the eviction refusal, again
+    assert not (root / SLUG).exists()

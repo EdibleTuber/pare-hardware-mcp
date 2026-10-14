@@ -214,12 +214,48 @@ async def console_capture(session: str, name: str, from_cursor: int = 0,
     except KeyError:
         return _err(f"no such session {session!r}")
     try:
+        # Pre-checks (spec §5.1-5.5), cheapest first, before anything is opened.
+        # The descriptor channel has no field to say "the file starts later than
+        # asked", so a window that cannot be written whole is refused, never
+        # silently shortened.
+        if CONFIG.artifact_root is None:
+            return _err("no artifact root declared on this worker: set "
+                        "PARE_HW_ARTIFACT_ROOT in the unit environment (and "
+                        "artifact_root in workers.yaml)")
+        if not project_slug or not expected_drive_id:
+            return _err("the daemon did not inject the reserved artifact "
+                        "arguments (slug, expected drive id); this worker was "
+                        "reached without artifact dispatch wiring")
         head = sess.buffer.head
         to = head if to_cursor is None else to_cursor
+        oldest = max(0, head - sess.buffer.capacity)
+        if from_cursor < 0 or from_cursor > head or to < 0 or to > head:
+            # Neither is a position this API ever handed out: refused, not
+            # clamped (spec §4) -- same surface as console_read's.
+            return _err(f"invalid cursor for session {session!r} "
+                        f"(from_cursor={from_cursor}, to_cursor={to}, head={head})")
+        if from_cursor < oldest:
+            return _err(f"from_cursor {from_cursor} is before the oldest "
+                        f"retained byte {oldest}: {oldest - from_cursor} bytes "
+                        f"were evicted by wraparound. Re-request from "
+                        f"from_cursor={oldest}; the evicted prefix is gone.")
+        if to <= from_cursor:
+            return _err(f"empty window (from_cursor {from_cursor} >= "
+                        f"to_cursor {to}): a zero-byte artifact would "
+                        f"attest nothing")
         # One read of [from_cursor, to): snapshot, not drain. Inline, like
         # console_read's -- the buffer lock is a leaf held for a memory copy.
-        data, _next, _dropped, _remaining = sess.buffer.read(
+        data, _next, dropped, _remaining = sess.buffer.read(
             from_cursor, to - from_cursor)
+        if dropped:
+            # A wrap landed between the pre-check and this read: the read is
+            # clamped and would write a shorter file than claimed. Refuse
+            # with the eviction refusal; `oldest` advanced under us.
+            return _err(f"from_cursor {from_cursor} is before the oldest "
+                        f"retained byte {from_cursor + dropped}: {dropped} "
+                        f"bytes were evicted by wraparound. Re-request from "
+                        f"from_cursor={from_cursor + dropped}; the evicted "
+                        f"prefix is gone.")
     except SessionError as exc:
         # A close landed between MANAGER.get returning and the buffer being
         # read (spec §5.6) -- the same catch console_read carries.
