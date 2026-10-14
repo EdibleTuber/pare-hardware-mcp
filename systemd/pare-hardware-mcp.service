@@ -41,6 +41,12 @@ Environment=AGENT_WORKER_HOST=tailscale0
 Environment=AGENT_WORKER_PORT=9102
 Environment=PARE_HW_DEVICE=/dev/serial/by-id/usb-SecuringHardware.com_Tigard_V1.1_TG1119e7-if00-port0
 Environment=PARE_HW_EXPECT_SERIAL=TG1119e7
+# Artifact root: console_capture writes under it via pare-worker-kit's
+# open_artifact (one file per capture, at {root}/{slug}/{name});
+# bench_status inspects it read-only. The drive is fstab-mounted nofail
+# (PARE bench/INSTALL.md:186); a Pi that boots without it has an empty
+# directory there, and the sentinel-absent error is the named outcome.
+Environment=PARE_HW_ARTIFACT_ROOT=/mnt/bench-store
 # Bench relay (DSD TECH SH-UR04A, CP2102): by-path, because its serial is a
 # generic 0001 and by-id would be ambiguous. Target power is on channel 1,
 # normally-closed -- energising the channel CUTS the target's power.
@@ -68,6 +74,10 @@ PrivateTmp=true
 ProtectSystem=strict
 ProtectHome=true
 ReadOnlyPaths=/opt/pare/hardware-mcp
+# ProtectSystem=strict makes the whole tree read-only; without this hole
+# the sentinel is readable but every capture write is EROFS, and
+# bench_status reports writable: false on an otherwise healthy bench.
+ReadWritePaths=/mnt/bench-store
 # /dev needs a specific carve-out so udev symlinks resolve and the ttyUSB
 # device node is openable. DeviceAllow narrows the /dev exposure.
 DevicePolicy=closed

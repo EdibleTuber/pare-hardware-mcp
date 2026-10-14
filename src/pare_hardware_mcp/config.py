@@ -61,11 +61,15 @@ class Config:
     # no lever of any kind: the rate list no longer affects the budget, so
     # passing fewer rates did not help either.
     scan_budget_s: float = DEFAULT_SCAN_BUDGET_SECONDS
-    # PARE_HW_ARTIFACT_ROOT: the directory `bench_status` inspects for
-    # presence, writability and a `.bench-store-id` drive id. Not opened,
-    # written to, or otherwise dispatched against by phase 1 -- artifacts are
-    # out of scope (see contract.py) -- so `None` when unset is a normal
-    # "this worker has no artifact root declared" state, not an error.
+    # PARE_HW_ARTIFACT_ROOT: the artifact drive root. console_capture
+    # writes under it via pare-worker-kit's open_artifact (one file per
+    # capture, at {root}/{slug}/{name}); bench_status inspects it
+    # read-only (present, writable, .bench-store-id). `None` when unset
+    # is a normal state out of process and a NAMED refusal at capture
+    # time -- the daemon refuses an undeclared workers.yaml root before
+    # dispatch (parent spec §6 step 2), and bench_status's
+    # declared/present/writable/drive_id report is how the operator
+    # reconciles the two declarations.
     artifact_root: str | None = None
     # PARE_HW_BUFFER_BYTES: worker-configurable capture-buffer capacity. The
     # design derives 64 MiB (ringbuffer.DEFAULT_CAPACITY) as the default from
